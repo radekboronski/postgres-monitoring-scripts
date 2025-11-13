@@ -48,6 +48,42 @@ chmod +x run_monitoring.sh
 ./run_monitoring.sh
 ```
 
+------------- Constraints Parameters Bloat ------------------------
+
+### 4. Refresh repo
+
+```bash
+git pull origin main
+```
+
+Above should download 4 files from repo
+
+```bash
+bloat_analysis.sql
+constraint_analysis.sql
+parameter_analysis.sql
+const_bloat_param_analysis.sh
+```
+
+### 4. Edit const_bloat_param_analysis.sh
+
+```bash
+#!/bin/bash
+HOST=
+PORT=
+USER=postgress
+DBNAME=
+```
+
+### 4. Run
+
+```bash
+chmod +x const_bloat_param_analysis.sh
+./const_bloat_param_analysis.sh
+```
+
+
+
 ## What it analyzes
 
 - Top 20 slowest queries
@@ -58,8 +94,13 @@ chmod +x run_monitoring.sh
 - VACUUM statistics
 - I/O and temp files
 - Optimization recommendations
+- Bloated tables
+- Connection parameters
+- Constraints issues
 
 ## Output
 
 Logs are saved as: `session_YYYYMMDD_HHMMSS.log`
-
+Log saved to: parameter_YYYYMMDD_HHMMSS.log
+Log saved to: constraint_analysis_YYYYMMDD_HHMMSS.log
+Log saved to: bloat_analysis_YYYYMMDD_HHMMSS.log
