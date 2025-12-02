@@ -2,9 +2,9 @@
 # ============================================================================
 # Pipeline Monitor - Collects diagnostics during pipeline run
 # ============================================================================
-# Usage: ./monitor_pipeline.sh [duration_minutes] [db_name] [db_user] [db_host] [db_port]
-# Example: ./monitor_pipeline.sh 60 terrogence postgres localhost 5432
-#          ./monitor_pipeline.sh 60 terrogence postgres /tmp        # for socket
+# Usage: ./monitor_pipeline.sh [duration_minutes] [db_name] [db_user] [db_host] [db_port] [schema]
+# Example: ./monitor_pipeline.sh 60 terrogence postgres localhost 5432 public
+#          ./monitor_pipeline.sh 60 terrogence postgres /tmp 5432 test
 #          ./monitor_pipeline.sh 60 terrogence radek localhost 5433
 # ============================================================================
 
@@ -13,10 +13,11 @@ DB_NAME=${2:-terrogence}
 DB_USER=${3:-test_user}
 DB_HOST=${4:-localhost}
 DB_PORT=${5:-5433}
+DB_SCHEMA=${6:-"test, public"}
 
 # Intervals (in seconds)
 LIGHT_INTERVAL=30      # Lightweight check every 30 sec
-FULL_INTERVAL=120      # Full diagnostic every 5 min
+FULL_INTERVAL=300      # Full diagnostic every 5 min
 
 # Build psql connection string
 if [[ "$DB_HOST" == /* ]]; then
@@ -56,7 +57,7 @@ echo "==========================================================================
 echo "Pipeline Monitor Started"
 echo "============================================================================"
 echo "Duration: ${DURATION_MINUTES} minutes"
-echo "Database: ${DB_NAME} (host: ${DB_HOST}, port: ${DB_PORT}, user: ${DB_USER})"
+echo "Database: ${DB_NAME} (host: ${DB_HOST}, port: ${DB_PORT}, user: ${DB_USER}, schema: ${DB_SCHEMA})"
 echo "Output: ${OUTPUT_DIR}/"
 echo "Light samples: every ${LIGHT_INTERVAL}s"
 echo "Full diagnostics: every ${FULL_INTERVAL}s"
@@ -79,7 +80,7 @@ run_light_monitor() {
     echo "" >> "$LIGHT_LOG"
     echo "========== SAMPLE $SAMPLE_COUNT - $(date '+%Y-%m-%d %H:%M:%S') ==========" >> "$LIGHT_LOG"
     
-    psql $PSQL_CONN -q -f pg_monitor_light.sql 2>&1 >> "$LIGHT_LOG"
+    psql $PSQL_CONN -q -c "SET search_path TO $DB_SCHEMA;" -f pg_monitor_light.sql 2>&1 >> "$LIGHT_LOG"
     
     # Check for blocking - if found, log separately
     BLOCKED=$(psql $PSQL_CONN -t -c "
@@ -115,7 +116,7 @@ run_full_diagnostic() {
     echo "" >> "$FULL_LOG"
     echo "========== FULL DIAGNOSTIC - $(date '+%Y-%m-%d %H:%M:%S') ==========" >> "$FULL_LOG"
     
-    psql $PSQL_CONN -f pg_diagnostic_queries.sql 2>&1 >> "$FULL_LOG"
+    psql $PSQL_CONN -c "SET search_path TO $DB_SCHEMA;" -f pg_diagnostic_queries.sql 2>&1 >> "$FULL_LOG"
 }
 
 # Main monitoring loop
@@ -159,7 +160,7 @@ PROBLEM_LOG="$OUTPUT_DIR/problem_analysis.log"
 echo "========== PROBLEM ANALYSIS - $(date '+%Y-%m-%d %H:%M:%S') ==========" > "$PROBLEM_LOG"
 
 if [ -f "pg_problem_analysis.sql" ]; then
-    psql $PSQL_CONN -f pg_problem_analysis.sql 2>&1 >> "$PROBLEM_LOG"
+    psql $PSQL_CONN -c "SET search_path TO $DB_SCHEMA;" -f pg_problem_analysis.sql 2>&1 >> "$PROBLEM_LOG"
     echo "Problem analysis complete: $PROBLEM_LOG"
 else
     echo "WARNING: pg_problem_analysis.sql not found - skipping"

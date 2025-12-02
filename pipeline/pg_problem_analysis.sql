@@ -6,7 +6,7 @@ SET search_path TO test, public;
 \echo ''
 \echo '============================================================================'
 \echo 'Pipeline-Specific Problem Analysis'
-\echo 'Telegram/WhatsApp Ingestion'
+\echo 'Data Ingestion Pipeline'
 \echo '============================================================================'
 \echo 'Purpose: Detect concurrency and data integrity issues'
 \echo '============================================================================'
@@ -553,34 +553,130 @@ WHERE tablename = 'countries';
 
 \echo ''
 \echo '============================================================================'
-\echo 'PROBLEM 11: QUERY EXECUTION PLANS (EXPLAIN ANALYZE)'
-\echo 'WARNING: These execute actual queries - run on test data or replica'
+\echo 'PROBLEM 11: MISSING INDEXES ON CRITICAL COLUMNS'
 \echo '============================================================================'
 \echo ''
 
 \echo '----------------------------------------------------------------------------'
-\echo '11.1. LATERAL JOIN cost analysis (get_group_messages pattern)'
+\echo '11.1. Required indexes for pipeline performance'
 \echo '----------------------------------------------------------------------------'
 
--- Get a sample group_id for testing
-DO $$
-DECLARE
-    v_group_id INTEGER;
-BEGIN
-    SELECT id INTO v_group_id FROM entities WHERE type = 'group' AND status = '1' LIMIT 1;
-    
-    IF v_group_id IS NOT NULL THEN
-        RAISE NOTICE 'Testing with group_id: %', v_group_id;
-        RAISE NOTICE 'Run this EXPLAIN manually to see full plan:';
-        RAISE NOTICE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT i.*, mad.text_body FROM items i LEFT JOIN LATERAL (SELECT text_body FROM message_application_data WHERE item_id = i.id AND status != ''5'' LIMIT 1) mad ON true WHERE i.group_id = % AND i.status = ''1'' ORDER BY i.timestamp DESC LIMIT 100;', v_group_id;
-    ELSE
-        RAISE NOTICE 'No groups found for testing';
-    END IF;
-END $$;
+SELECT 
+    'entities' AS table_name,
+    'scrapping_id' AS column_name,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'entities' 
+        AND indexdef LIKE '%scrapping_id%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END AS index_status
+UNION ALL
+SELECT 'entities', 'type',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'entities' 
+        AND indexdef LIKE '%type%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'entities', 'status (partial)',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'entities' 
+        AND indexdef LIKE '%status%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'group_memberships', 'group_id',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'group_memberships' 
+        AND indexdef LIKE '%group_id%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'group_memberships', 'member_id',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'group_memberships' 
+        AND indexdef LIKE '%member_id%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'items', 'group_id',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'items' 
+        AND indexdef LIKE '%group_id%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'items', 'sender_id',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'items' 
+        AND indexdef LIKE '%sender_id%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'items', 'scrapping_id',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'items' 
+        AND indexdef LIKE '%scrapping_id%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'items', 'timestamp',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'items' 
+        AND indexdef LIKE '%timestamp%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'message_application_data', 'item_id',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'message_application_data' 
+        AND indexdef LIKE '%item_id%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'entity_images', 'entity_id',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'entity_images' 
+        AND indexdef LIKE '%entity_id%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'entity_relations', 'from_entity',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'entity_relations' 
+        AND indexdef LIKE '%from_entity%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END
+UNION ALL
+SELECT 'entity_relations', 'to_entity',
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_indexes 
+        WHERE tablename = 'entity_relations' 
+        AND indexdef LIKE '%to_entity%'
+    ) THEN 'EXISTS' ELSE 'MISSING' END;
 
 \echo ''
 \echo '----------------------------------------------------------------------------'
-\echo '11.2. Entity lookup by scrapping_id - index usage check'
+\echo '11.2. Index definitions on pipeline tables (for review)'
+\echo '----------------------------------------------------------------------------'
+
+SELECT 
+    tablename,
+    indexname,
+    indexdef
+FROM pg_indexes
+WHERE tablename IN ('entities', 'group_memberships', 'items', 
+                    'message_application_data', 'entity_images', 
+                    'entity_relations', 'personal_details', 'phone_appdata')
+ORDER BY tablename, indexname;
+
+\echo ''
+\echo '============================================================================'
+\echo 'PROBLEM 12: QUERY EXECUTION PLANS'
+\echo '============================================================================'
+\echo ''
+
+\echo '----------------------------------------------------------------------------'
+\echo '12.1. Entity lookup by scrapping_id - index usage check'
 \echo '----------------------------------------------------------------------------'
 
 EXPLAIN (COSTS ON)
@@ -592,7 +688,7 @@ WHERE scrapping_id = 'test_scrapping_id_12345'
 
 \echo ''
 \echo '----------------------------------------------------------------------------'
-\echo '11.3. Group memberships lookup - index usage check'
+\echo '12.2. Group memberships lookup - index usage check'
 \echo '----------------------------------------------------------------------------'
 
 EXPLAIN (COSTS ON)
@@ -603,7 +699,7 @@ WHERE gm.group_id = 1
 
 \echo ''
 \echo '----------------------------------------------------------------------------'
-\echo '11.4. Items by group - index usage check'
+\echo '12.3. Items by group - index usage check'
 \echo '----------------------------------------------------------------------------'
 
 EXPLAIN (COSTS ON)
@@ -616,10 +712,22 @@ LIMIT 100;
 
 \echo ''
 \echo '----------------------------------------------------------------------------'
-\echo '11.5. Inheritance UPDATE impact estimation'
+\echo '12.4. Message application data join - index usage check'
 \echo '----------------------------------------------------------------------------'
 
--- Show how many rows would be affected by inheritance update
+EXPLAIN (COSTS ON)
+SELECT i.id, mad.text_body
+FROM items i
+LEFT JOIN message_application_data mad ON mad.item_id = i.id AND mad.status != '5'
+WHERE i.group_id = 1
+  AND i.status = '1'
+LIMIT 100;
+
+\echo ''
+\echo '----------------------------------------------------------------------------'
+\echo '12.5. Inheritance UPDATE impact estimation'
+\echo '----------------------------------------------------------------------------'
+
 SELECT 
     'Rows affected by single group inheritance UPDATE' AS metric,
     COUNT(*) AS count
@@ -631,12 +739,12 @@ WHERE gm.group_id = (SELECT id FROM entities WHERE type = 'group' AND status = '
 
 \echo ''
 \echo '============================================================================'
-\echo 'PROBLEM 12: RECOMMENDED FIXES (DDL statements)'
+\echo 'PROBLEM 13: RECOMMENDED FIXES (DDL statements)'
 \echo '============================================================================'
 \echo ''
 
 \echo '----------------------------------------------------------------------------'
-\echo '12.1. Missing UNIQUE indexes for ON CONFLICT (copy and run manually)'
+\echo '13.1. Missing UNIQUE indexes for ON CONFLICT (copy and run manually)'
 \echo '----------------------------------------------------------------------------'
 
 SELECT '-- Run these to enable ON CONFLICT handling:' AS recommendation
@@ -683,7 +791,7 @@ SELECT '    ON entity_relations(from_entity, to_entity, relation_type) WHERE sta
 
 \echo ''
 \echo '----------------------------------------------------------------------------'
-\echo '12.2. Performance indexes (copy and run manually)'
+\echo '13.2. Performance indexes (copy and run manually)'
 \echo '----------------------------------------------------------------------------'
 
 SELECT '-- Additional indexes for query performance:' AS recommendation
@@ -711,6 +819,54 @@ UNION ALL
 SELECT 'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_mad_item_active'
 UNION ALL
 SELECT '    ON message_application_data(item_id) WHERE status != ''5'';';
+
+\echo ''
+\echo '============================================================================'
+\echo 'DIAGNOSIS: ROOT CAUSE INTERPRETATION'
+\echo '============================================================================'
+\echo ''
+
+\echo '----------------------------------------------------------------------------'
+\echo 'Interpreting duplicate root causes'
+\echo '----------------------------------------------------------------------------'
+
+SELECT 
+    '>>> ENTITIES <<<' AS table_name,
+    '' AS interpretation
+UNION ALL
+SELECT '', ''
+UNION ALL
+SELECT 
+    'Race condition (< 1 sec)',
+    'INSERT queries lack ON CONFLICT clause. Two processes inserted same scrapping_id simultaneously.'
+UNION ALL
+SELECT 
+    'Retry logic (1-60 sec)',
+    'Application retried INSERT without checking if record exists. Add ON CONFLICT DO UPDATE or check before insert.'
+UNION ALL
+SELECT 
+    'Duplicate source (> 60 sec)',
+    'Same entity ingested multiple times from source. Either source sends duplicates OR pipeline reprocesses same data.'
+UNION ALL
+SELECT '', ''
+UNION ALL
+SELECT 
+    '>>> RECOMMENDATION <<<',
+    ''
+UNION ALL
+SELECT 
+    'If duplicates exist:',
+    'Add UNIQUE index + ON CONFLICT clause to INSERT queries'
+UNION ALL
+SELECT 
+    'Example fix:',
+    'INSERT INTO entities (...) VALUES (...) ON CONFLICT (scrapping_id, type) WHERE status != ''5'' DO UPDATE SET ...'
+UNION ALL
+SELECT '', ''
+UNION ALL
+SELECT 
+    '>>> MISSING UNIQUE INDEXES <<<',
+    'Without UNIQUE index, ON CONFLICT will NOT work. See Problem 13.1 for required indexes.';
 
 \echo ''
 \echo '============================================================================'
@@ -788,6 +944,96 @@ WHERE gm.status != '5'
     NOT EXISTS (SELECT 1 FROM entities e WHERE e.id = gm.member_id AND e.status != '5')
     OR NOT EXISTS (SELECT 1 FROM entities e WHERE e.id = gm.group_id AND e.status != '5')
   );
+
+\echo ''
+\echo '----------------------------------------------------------------------------'
+\echo 'Duplicate root cause analysis - entities'
+\echo '  < 1 sec apart  = Race condition (missing ON CONFLICT)'
+\echo '  1-60 sec apart = Retry logic issue'
+\echo '  > 60 sec apart = Duplicate source data'
+\echo '----------------------------------------------------------------------------'
+
+SELECT 
+    CASE 
+        WHEN seconds_apart < 1 THEN 'Race condition (< 1 sec)'
+        WHEN seconds_apart < 60 THEN 'Retry logic (1-60 sec)'
+        ELSE 'Duplicate source (> 60 sec)'
+    END AS likely_cause,
+    COUNT(*) AS duplicate_pairs
+FROM (
+    SELECT 
+        EXTRACT(EPOCH FROM (e2.system_creation_time - e1.system_creation_time)) AS seconds_apart
+    FROM entities e1
+    JOIN entities e2 ON e1.scrapping_id = e2.scrapping_id 
+        AND e1.type = e2.type 
+        AND e1.id < e2.id
+    WHERE e1.status != '5' AND e2.status != '5'
+) timing
+GROUP BY 
+    CASE 
+        WHEN seconds_apart < 1 THEN 'Race condition (< 1 sec)'
+        WHEN seconds_apart < 60 THEN 'Retry logic (1-60 sec)'
+        ELSE 'Duplicate source (> 60 sec)'
+    END
+ORDER BY duplicate_pairs DESC;
+
+\echo ''
+\echo '----------------------------------------------------------------------------'
+\echo 'Duplicate root cause analysis - group_memberships'
+\echo '----------------------------------------------------------------------------'
+
+SELECT 
+    CASE 
+        WHEN seconds_apart < 1 THEN 'Race condition (< 1 sec)'
+        WHEN seconds_apart < 60 THEN 'Retry logic (1-60 sec)'
+        ELSE 'Duplicate source (> 60 sec)'
+    END AS likely_cause,
+    COUNT(*) AS duplicate_pairs
+FROM (
+    SELECT 
+        EXTRACT(EPOCH FROM (gm2.system_creation_time - gm1.system_creation_time)) AS seconds_apart
+    FROM group_memberships gm1
+    JOIN group_memberships gm2 ON gm1.group_id = gm2.group_id 
+        AND gm1.member_id = gm2.member_id 
+        AND gm1.id < gm2.id
+    WHERE gm1.status != '5' AND gm2.status != '5'
+) timing
+GROUP BY 
+    CASE 
+        WHEN seconds_apart < 1 THEN 'Race condition (< 1 sec)'
+        WHEN seconds_apart < 60 THEN 'Retry logic (1-60 sec)'
+        ELSE 'Duplicate source (> 60 sec)'
+    END
+ORDER BY duplicate_pairs DESC;
+
+\echo ''
+\echo '----------------------------------------------------------------------------'
+\echo 'Duplicate root cause analysis - items'
+\echo '----------------------------------------------------------------------------'
+
+SELECT 
+    CASE 
+        WHEN seconds_apart < 1 THEN 'Race condition (< 1 sec)'
+        WHEN seconds_apart < 60 THEN 'Retry logic (1-60 sec)'
+        ELSE 'Duplicate source (> 60 sec)'
+    END AS likely_cause,
+    COUNT(*) AS duplicate_pairs
+FROM (
+    SELECT 
+        EXTRACT(EPOCH FROM (i2.system_creation_time - i1.system_creation_time)) AS seconds_apart
+    FROM items i1
+    JOIN items i2 ON i1.scrapping_id = i2.scrapping_id 
+        AND i1.id < i2.id
+    WHERE i1.status != '5' AND i2.status != '5'
+      AND i1.scrapping_id IS NOT NULL
+) timing
+GROUP BY 
+    CASE 
+        WHEN seconds_apart < 1 THEN 'Race condition (< 1 sec)'
+        WHEN seconds_apart < 60 THEN 'Retry logic (1-60 sec)'
+        ELSE 'Duplicate source (> 60 sec)'
+    END
+ORDER BY duplicate_pairs DESC;
 
 \echo ''
 \echo '============================================================================'

@@ -5,7 +5,7 @@ SET search_path TO test, public;
 
 \echo ''
 \echo '============================================================================'
-\echo 'PostgreSQL Diagnostic Queries - Telegram/WhatsApp Ingestion Pipeline'
+\echo 'PostgreSQL Diagnostic Queries - Data Ingestion Pipeline'
 \echo '============================================================================'
 \echo 'Purpose: Identify concurrency issues, locks, missing indexes, bottlenecks'
 \echo 'Usage: Run during peak load for best results'
