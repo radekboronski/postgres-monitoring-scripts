@@ -1,0 +1,487 @@
+-- ============================================================================
+-- FORMUNAUTS MONITORING SCRIPT
+-- Dostosowany do pg_stat_statements 1.4
+-- ============================================================================
+
+\echo '============================================================================'
+\echo 'PART 1: PREPARATION - CHECKING EXTENSIONS'
+\echo '============================================================================'
+
+-- 1.1. Check installed extensions
+SELECT 
+    extname AS extension_name,
+    extversion AS version,
+    nspname AS schema
+FROM pg_extension e
+JOIN pg_namespace n ON e.extnamespace = n.oid
+ORDER BY extname;
+
+\echo '============================================================================'
+\echo 'PART 2: SQL QUERY OPTIMIZATION'
+\echo '============================================================================'
+
+-- 2.1. TOP 20 slowest queries (by average execution time)
+\echo '-- 2.1. TOP 20 slowest queries'
+SELECT 
+    queryid,
+    LEFT(query, 100) AS query_preview,
+    calls,
+    ROUND(total_time::numeric, 2) AS total_time_ms,
+    ROUND(mean_time::numeric, 2) AS avg_time_ms,
+    ROUND(min_time::numeric, 2) AS min_time_ms,
+    ROUND(max_time::numeric, 2) AS max_time_ms,
+    ROUND(stddev_time::numeric, 2) AS stddev_time_ms,
+    rows,
+    ROUND((100.0 * shared_blks_hit / NULLIF(shared_blks_hit + shared_blks_read, 0))::numeric, 2) AS cache_hit_ratio,
+    shared_blks_read,
+    shared_blks_hit,
+    shared_blks_dirtied,
+    shared_blks_written,
+    temp_blks_read,
+    temp_blks_written
+FROM pg_stat_statements
+WHERE query NOT LIKE '%pg_stat_statements%'
+    AND query NOT LIKE 'DEALLOCATE%'
+ORDER BY mean_time DESC
+LIMIT 20;
+
+-- 2.2. Queries with highest total execution time
+\echo '-- 2.2. Queries with highest total execution time'
+SELECT
+    queryid,
+    LEFT(query, 100) AS query_preview,
+    calls,
+    ROUND(total_time::numeric, 2) AS total_time_ms,
+    ROUND((total_time / 1000 / 60)::numeric, 2) AS total_time_minutes,
+    ROUND(mean_time::numeric, 2) AS avg_time_ms,
+    ROUND((100.0 * total_time / SUM(total_time) OVER ())::numeric, 2) AS pct_total_time,
+    ROUND((100.0 * calls / SUM(calls) OVER ())::numeric, 2) AS pct_total_calls
+FROM pg_stat_statements
+WHERE query NOT LIKE '%pg_stat_statements%'
+ORDER BY total_time DESC
+LIMIT 20;
+
+-- 2.3. Queries with worst cache hit ratio
+\echo '-- 2.3. Queries with worst cache hit ratio'
+SELECT
+    queryid,
+    LEFT(query, 100) AS query_preview,
+    calls,
+    shared_blks_hit,
+    shared_blks_read,
+    ROUND((100.0 * shared_blks_hit / NULLIF(shared_blks_hit + shared_blks_read, 0))::numeric, 2) AS cache_hit_ratio,
+    ROUND(mean_time::numeric, 2) AS avg_time_ms
+FROM pg_stat_statements
+WHERE (shared_blks_hit + shared_blks_read) > 0
+    AND query NOT LIKE '%pg_stat_statements%'
+ORDER BY (shared_blks_hit::float / NULLIF(shared_blks_hit + shared_blks_read, 0)) ASC
+LIMIT 20;
+
+-- 2.4. Queries using temp files
+\echo '-- 2.4. Queries using temp files'
+SELECT
+    queryid,
+    LEFT(query, 100) AS query_preview,
+    calls,
+    temp_blks_read,
+    temp_blks_written,
+    ROUND((temp_blks_written * 8192 / 1024.0 / 1024.0)::numeric, 2) AS temp_mb_written,
+    ROUND(mean_time::numeric, 2) AS avg_time_ms,
+    ROUND((mean_time * calls / 1000)::numeric, 2) AS total_time_sec
+FROM pg_stat_statements
+WHERE temp_blks_written > 0
+ORDER BY temp_blks_written DESC
+LIMIT 20;
+
+-- 2.5. Queries with high execution time variance
+\echo '-- 2.5. Queries with high variance'
+SELECT
+    queryid,
+    LEFT(query, 100) AS query_preview,
+    calls,
+    ROUND(mean_time::numeric, 2) AS avg_time_ms,
+    ROUND(stddev_time::numeric, 2) AS stddev_ms,
+    ROUND((stddev_time / NULLIF(mean_time, 0))::numeric, 2) AS coefficient_of_variation,
+    ROUND(min_time::numeric, 2) AS min_time_ms,
+    ROUND(max_time::numeric, 2) AS max_time_ms
+FROM pg_stat_statements
+WHERE calls > 10
+    AND mean_time > 0
+    AND query NOT LIKE '%pg_stat_statements%'
+ORDER BY (stddev_time / NULLIF(mean_time, 0)) DESC
+LIMIT 20;
+
+\echo '============================================================================'
+\echo 'PART 3: INDEX ANALYSIS'
+\echo '============================================================================'
+
+-- 3.1. Sequential scans vs Index scans ratio
+\echo '-- 3.1. Sequential vs Index scans'
+SELECT
+    schemaname,
+    relname AS table_name,
+    seq_scan,
+    seq_tup_read,
+    idx_scan,
+    COALESCE(idx_tup_fetch, 0) AS idx_tup_fetch,
+    CASE
+        WHEN seq_scan = 0 THEN 0
+        ELSE ROUND((seq_tup_read::numeric / seq_scan), 2)
+    END AS avg_seq_tup_per_scan,
+    ROUND((100.0 * idx_scan / NULLIF(seq_scan + idx_scan, 0))::numeric, 2) AS index_usage_pct,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||relname)) AS total_size
+FROM pg_stat_user_tables
+WHERE seq_scan > 0 OR idx_scan > 0
+ORDER BY seq_scan DESC, seq_tup_read DESC
+LIMIT 30;
+
+-- 3.2. Unused indexes
+\echo '-- 3.2. Unused indexes'
+SELECT
+    schemaname,
+    relname AS table_name,
+    indexrelname AS index_name,
+    idx_scan,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    pg_size_pretty(pg_total_relation_size(relid)) AS table_size
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+    AND indexrelid NOT IN (SELECT indexrelid FROM pg_index WHERE indisprimary OR indisunique)
+ORDER BY pg_relation_size(indexrelid) DESC
+LIMIT 30;
+
+-- 3.3. Duplicate indexes
+\echo '-- 3.3. Duplicate indexes'
+SELECT
+    pg_size_pretty(SUM(pg_relation_size(idx))::bigint) AS size,
+    (ARRAY_AGG(idx))[1] AS idx1,
+    (ARRAY_AGG(idx))[2] AS idx2,
+    (ARRAY_AGG(idx))[3] AS idx3
+FROM (
+    SELECT
+        indexrelid::regclass AS idx,
+        (indrelid::text || E'\n' || indclass::text || E'\n' || indkey::text || E'\n' ||
+         COALESCE(indexprs::text, '') || E'\n' || COALESCE(indpred::text, '')) AS key
+    FROM pg_index
+) sub
+GROUP BY key
+HAVING COUNT(*) > 1
+ORDER BY SUM(pg_relation_size(idx)) DESC;
+
+-- 3.4. Missing indexes
+\echo '-- 3.4. Missing indexes (high seq scans)'
+SELECT
+    schemaname,
+    relname AS table_name,
+    seq_scan,
+    seq_tup_read,
+    CASE WHEN seq_scan > 0 THEN seq_tup_read / seq_scan ELSE 0 END AS avg_tup_per_scan,
+    idx_scan,
+    n_live_tup,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||relname)) AS table_size
+FROM pg_stat_user_tables
+WHERE seq_scan > 100
+    AND n_live_tup > 10000
+    AND (idx_scan IS NULL OR idx_scan < seq_scan * 0.1)
+ORDER BY seq_tup_read DESC
+LIMIT 20;
+
+\echo '============================================================================'
+\echo 'PART 4: CONNECTIONS AND SESSIONS'
+\echo '============================================================================'
+
+-- 4.1. Current connections summary
+\echo '-- 4.1. Connections summary'
+SELECT
+    datname AS database,
+    usename AS username,
+    state,
+    COUNT(*) AS connections,
+    MAX(EXTRACT(EPOCH FROM (now() - backend_start)))::int AS max_conn_age_sec
+FROM pg_stat_activity
+WHERE pid != pg_backend_pid()
+GROUP BY datname, usename, state
+ORDER BY connections DESC;
+
+-- 4.2. Long running queries
+\echo '-- 4.2. Long running queries (> 1 min)'
+SELECT
+    pid,
+    usename,
+    datname,
+    state,
+    EXTRACT(EPOCH FROM (now() - query_start))::int AS duration_sec,
+    wait_event_type,
+    wait_event,
+    LEFT(query, 200) AS query
+FROM pg_stat_activity
+WHERE state = 'active'
+    AND query_start < now() - INTERVAL '1 minute'
+    AND pid != pg_backend_pid()
+ORDER BY query_start;
+
+-- 4.3. Idle in transaction
+\echo '-- 4.3. Idle in transaction'
+SELECT
+    pid,
+    usename,
+    datname,
+    state,
+    EXTRACT(EPOCH FROM (now() - state_change))::int AS idle_in_txn_sec,
+    LEFT(query, 200) AS last_query
+FROM pg_stat_activity
+WHERE state LIKE '%transaction%'
+ORDER BY state_change;
+
+\echo '============================================================================'
+\echo 'PART 5: LOCKS AND BLOCKING'
+\echo '============================================================================'
+
+-- 5.1. Current locks
+\echo '-- 5.1. Current locks'
+SELECT
+    l.pid,
+    l.locktype,
+    l.mode,
+    l.granted,
+    l.relation::regclass AS relation,
+    a.usename,
+    a.state,
+    LEFT(a.query, 100) AS query
+FROM pg_locks l
+JOIN pg_stat_activity a ON l.pid = a.pid
+WHERE l.relation IS NOT NULL
+    AND a.pid != pg_backend_pid()
+ORDER BY l.granted, l.pid;
+
+-- 5.2. Blocking queries
+\echo '-- 5.2. Blocking queries'
+SELECT
+    blocked.pid AS blocked_pid,
+    blocked.usename AS blocked_user,
+    blocking.pid AS blocking_pid,
+    blocking.usename AS blocking_user,
+    LEFT(blocked.query, 100) AS blocked_query,
+    LEFT(blocking.query, 100) AS blocking_query
+FROM pg_stat_activity blocked
+JOIN pg_locks blocked_locks ON blocked.pid = blocked_locks.pid
+JOIN pg_locks blocking_locks ON blocked_locks.locktype = blocking_locks.locktype
+    AND blocked_locks.relation = blocking_locks.relation
+    AND blocked_locks.pid != blocking_locks.pid
+JOIN pg_stat_activity blocking ON blocking_locks.pid = blocking.pid
+WHERE NOT blocked_locks.granted
+    AND blocking_locks.granted;
+
+\echo '============================================================================'
+\echo 'PART 6: TABLE STATISTICS'
+\echo '============================================================================'
+
+-- 6.1. Table sizes
+\echo '-- 6.1. Table sizes'
+SELECT
+    schemaname,
+    relname AS table_name,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||relname)) AS total_size,
+    pg_size_pretty(pg_relation_size(schemaname||'.'||relname)) AS table_size,
+    pg_size_pretty(pg_indexes_size(relid)) AS indexes_size,
+    n_live_tup AS live_rows,
+    n_dead_tup AS dead_rows,
+    ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct
+FROM pg_stat_user_tables
+ORDER BY pg_total_relation_size(schemaname||'.'||relname) DESC
+LIMIT 30;
+
+-- 6.2. Tables needing VACUUM
+\echo '-- 6.2. Tables needing VACUUM'
+SELECT
+    schemaname,
+    relname AS table_name,
+    n_live_tup,
+    n_dead_tup,
+    ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze,
+    last_autoanalyze
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+    OR n_dead_tup > n_live_tup * 0.1
+ORDER BY n_dead_tup DESC
+LIMIT 20;
+
+-- 6.3. Tables without recent ANALYZE
+\echo '-- 6.3. Tables without recent ANALYZE'
+SELECT
+    schemaname,
+    relname AS table_name,
+    n_live_tup,
+    last_analyze,
+    last_autoanalyze,
+    GREATEST(last_analyze, last_autoanalyze) AS last_any_analyze
+FROM pg_stat_user_tables
+WHERE n_live_tup > 1000
+    AND (last_analyze IS NULL OR last_analyze < now() - INTERVAL '7 days')
+    AND (last_autoanalyze IS NULL OR last_autoanalyze < now() - INTERVAL '7 days')
+ORDER BY n_live_tup DESC
+LIMIT 20;
+
+\echo '============================================================================'
+\echo 'PART 7: DATABASE STATISTICS'
+\echo '============================================================================'
+
+-- 7.1. Database statistics
+\echo '-- 7.1. Database statistics'
+SELECT
+    datname,
+    numbackends AS connections,
+    xact_commit AS commits,
+    xact_rollback AS rollbacks,
+    blks_read,
+    blks_hit,
+    ROUND(100.0 * blks_hit / NULLIF(blks_hit + blks_read, 0), 2) AS cache_hit_ratio,
+    tup_returned,
+    tup_fetched,
+    tup_inserted,
+    tup_updated,
+    tup_deleted,
+    conflicts,
+    deadlocks
+FROM pg_stat_database
+WHERE datname = current_database();
+
+-- 7.2. Database size
+\echo '-- 7.2. Database size'
+SELECT
+    datname,
+    pg_size_pretty(pg_database_size(datname)) AS size
+FROM pg_database
+WHERE datname = current_database();
+
+\echo '============================================================================'
+\echo 'PART 8: REPLICATION STATUS'
+\echo '============================================================================'
+
+-- 8.1. Replication slots
+\echo '-- 8.1. Replication slots'
+SELECT
+    slot_name,
+    plugin,
+    slot_type,
+    active,
+    restart_lsn,
+    confirmed_flush_lsn
+FROM pg_replication_slots;
+
+-- 8.2. Replication lag
+\echo '-- 8.2. Replication lag'
+SELECT
+    client_addr,
+    state,
+    sent_lsn,
+    write_lsn,
+    flush_lsn,
+    replay_lsn,
+    pg_wal_lsn_diff(sent_lsn, replay_lsn) AS lag_bytes
+FROM pg_stat_replication;
+
+\echo '============================================================================'
+\echo 'PART 9: CONFIGURATION CHECK'
+\echo '============================================================================'
+
+-- 9.1. Key performance settings
+\echo '-- 9.1. Key performance settings'
+SELECT name, setting, unit, context, short_desc
+FROM pg_settings
+WHERE name IN (
+    'shared_buffers',
+    'effective_cache_size',
+    'work_mem',
+    'maintenance_work_mem',
+    'max_connections',
+    'checkpoint_completion_target',
+    'wal_buffers',
+    'random_page_cost',
+    'effective_io_concurrency',
+    'max_worker_processes',
+    'max_parallel_workers_per_gather',
+    'max_parallel_workers',
+    'max_parallel_maintenance_workers',
+    'log_min_duration_statement',
+    'autovacuum',
+    'autovacuum_max_workers',
+    'autovacuum_vacuum_scale_factor',
+    'autovacuum_analyze_scale_factor'
+)
+ORDER BY name;
+
+\echo '============================================================================'
+\echo 'PART 10: HEALTH CHECK SUMMARY'
+\echo '============================================================================'
+
+SELECT
+    'Total Connections' AS metric,
+    COUNT(*)::text AS value
+FROM pg_stat_activity
+WHERE pid != pg_backend_pid()
+
+UNION ALL
+
+SELECT
+    'Active Queries',
+    COUNT(*)::text
+FROM pg_stat_activity
+WHERE state = 'active' AND pid != pg_backend_pid()
+
+UNION ALL
+
+SELECT
+    'Long Running (>5min)',
+    COUNT(*)::text
+FROM pg_stat_activity
+WHERE state = 'active'
+    AND query_start < now() - INTERVAL '5 minutes'
+    AND pid != pg_backend_pid()
+
+UNION ALL
+
+SELECT
+    'Idle in Transaction',
+    COUNT(*)::text
+FROM pg_stat_activity
+WHERE state LIKE '%transaction%'
+
+UNION ALL
+
+SELECT
+    'Active Locks',
+    COUNT(*)::text
+FROM pg_locks
+WHERE NOT granted
+
+UNION ALL
+
+SELECT
+    'Tables Needing VACUUM',
+    COUNT(*)::text
+FROM pg_stat_user_tables
+WHERE n_dead_tup > n_live_tup * 0.1
+
+UNION ALL
+
+SELECT
+    'Unused Indexes',
+    COUNT(*)::text
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+    AND indexrelid NOT IN (SELECT indexrelid FROM pg_index WHERE indisprimary OR indisunique)
+
+UNION ALL
+
+SELECT
+    'Cache Hit Ratio',
+    ROUND((100.0 * SUM(blks_hit) / NULLIF(SUM(blks_hit) + SUM(blks_read), 0))::numeric, 2)::text || '%'
+FROM pg_stat_database;
+
+\echo '============================================================================'
+\echo 'END OF FORMUNAUTS MONITORING SCRIPT'
+\echo '============================================================================'

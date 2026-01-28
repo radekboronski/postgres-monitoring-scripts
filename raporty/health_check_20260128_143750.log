@@ -1,0 +1,1814 @@
+-- ============================================================================
+-- PostgreSQL Comprehensive Health Check & Performance Report
+-- Generic Version - pg_stat_statements 1.4 compatible
+-- ============================================================================
+\echo ''
+
+\echo '╔══════════════════════════════════════════════════════════════════════════╗'
+╔══════════════════════════════════════════════════════════════════════════╗
+\echo '║        PostgreSQL Comprehensive Health Check & Performance Report        ║'
+║        PostgreSQL Comprehensive Health Check & Performance Report        ║
+\echo '╚══════════════════════════════════════════════════════════════════════════╝'
+╚══════════════════════════════════════════════════════════════════════════╝
+\echo ''
+
+-- ============================================================================
+-- SECTION 1: Executive Summary
+-- ============================================================================
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 1: Executive Summary'
+SECTION 1: Executive Summary
+\echo '============================================================================'
+============================================================================
+-- 1.1 Database overview
+\echo '-- 1.1 Database overview'
+-- 1.1 Database overview
+SELECT 
+    current_database() AS database_name,
+    current_user AS connected_as,
+    version() AS postgres_version,
+    pg_size_pretty(pg_database_size(current_database())) AS database_size,
+    (SELECT count(*) FROM pg_stat_user_tables) AS user_tables,
+    (SELECT count(*) FROM pg_stat_user_indexes) AS user_indexes,
+    pg_postmaster_start_time() AS server_start_time,
+    now() - pg_postmaster_start_time() AS uptime;
+ database_name |   connected_as   |                                         postgres_version                                         | database_size | user_tables | user_indexes |       server_start_time       |          uptime          
+---------------+------------------+--------------------------------------------------------------------------------------------------+---------------+-------------+--------------+-------------------------------+--------------------------
+ formunauts    | radoslawboronski | PostgreSQL 16.9 on x86_64-pc-linux-gnu, compiled by x86_64-pc-linux-gnu-gcc (GCC) 10.5.0, 64-bit | 54 GB         |         251 |         1254 | 2025-10-08 17:04:54.839611+00 | 111 days 20:32:56.322275
+(1 row)
+
+-- 1.2 Cache hit ratios
+\echo '-- 1.2 Cache hit ratios'
+-- 1.2 Cache hit ratios
+SELECT 
+    'Table Cache' AS cache_type,
+    ROUND(100.0 * sum(heap_blks_hit) / nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0), 2) AS hit_ratio_pct,
+    pg_size_pretty(sum(heap_blks_read)::bigint * 8192) AS data_read_from_disk,
+    pg_size_pretty(sum(heap_blks_hit)::bigint * 8192) AS data_read_from_cache
+FROM pg_statio_user_tables
+UNION ALL
+SELECT 
+    'Index Cache',
+    ROUND(100.0 * sum(idx_blks_hit) / nullif(sum(idx_blks_hit) + sum(idx_blks_read), 0), 2),
+    pg_size_pretty(sum(idx_blks_read)::bigint * 8192),
+    pg_size_pretty(sum(idx_blks_hit)::bigint * 8192)
+FROM pg_statio_user_indexes
+UNION ALL
+SELECT 
+    'TOAST Cache',
+    ROUND(100.0 * sum(toast_blks_hit) / nullif(sum(toast_blks_hit) + sum(toast_blks_read), 0), 2),
+    pg_size_pretty(sum(toast_blks_read)::bigint * 8192),
+    pg_size_pretty(sum(toast_blks_hit)::bigint * 8192)
+FROM pg_statio_user_tables
+WHERE toast_blks_read > 0 OR toast_blks_hit > 0;
+ cache_type  | hit_ratio_pct | data_read_from_disk | data_read_from_cache 
+-------------+---------------+---------------------+----------------------
+ Table Cache |         99.67 | 2771 GB             | 818 TB
+ Index Cache |         99.77 | 1152 GB             | 479 TB
+ TOAST Cache |         49.57 | 477 GB              | 469 GB
+(3 rows)
+
+-- 1.3 Connection statistics
+\echo '-- 1.3 Connection statistics'
+-- 1.3 Connection statistics
+SELECT 
+    count(*) AS total_connections,
+    count(*) FILTER (WHERE state = 'active') AS active,
+    count(*) FILTER (WHERE state = 'idle') AS idle,
+    count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_txn,
+    count(*) FILTER (WHERE state = 'idle in transaction (aborted)') AS idle_in_txn_aborted,
+    count(*) FILTER (WHERE wait_event_type IS NOT NULL) AS waiting,
+    (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_connections,
+    ROUND(100.0 * count(*) / (SELECT setting::int FROM pg_settings WHERE name = 'max_connections'), 2) AS usage_pct
+FROM pg_stat_activity
+WHERE datname = current_database();
+ total_connections | active | idle | idle_in_txn | idle_in_txn_aborted | waiting | max_connections | usage_pct 
+-------------------+--------+------+-------------+---------------------+---------+-----------------+-----------
+                13 |      3 |   10 |           0 |                   0 |      10 |            3457 |      0.38
+(1 row)
+
+-- 1.4 Transaction ID age (wraparound risk)
+\echo '-- 1.4 Transaction ID age (wraparound risk)'
+-- 1.4 Transaction ID age (wraparound risk)
+SELECT 
+    datname,
+    age(datfrozenxid) AS xid_age,
+    ROUND(100.0 * age(datfrozenxid) / 2147483647, 2) AS pct_to_wraparound,
+    2147483647 - age(datfrozenxid) AS xids_remaining,
+    CASE 
+        WHEN age(datfrozenxid) > 1500000000 THEN '🔴 CRITICAL - VACUUM FREEZE IMMEDIATELY!'
+        WHEN age(datfrozenxid) > 1000000000 THEN '🟠 WARNING - Plan VACUUM FREEZE'
+        WHEN age(datfrozenxid) > 500000000 THEN '🟡 MONITOR'
+        ELSE '🟢 OK' 
+    END AS status
+FROM pg_database
+WHERE datname = current_database();
+  datname   | xid_age | pct_to_wraparound | xids_remaining | status 
+------------+---------+-------------------+----------------+--------
+ formunauts |  144149 |              0.01 |     2147339498 | 🟢 OK
+(1 row)
+
+-- 1.5 Database statistics
+\echo '-- 1.5 Database activity statistics'
+-- 1.5 Database activity statistics
+SELECT 
+    datname,
+    numbackends AS connections,
+    xact_commit AS commits,
+    xact_rollback AS rollbacks,
+    CASE WHEN xact_commit + xact_rollback > 0 
+         THEN ROUND(100.0 * xact_rollback / (xact_commit + xact_rollback), 2) 
+         ELSE 0 END AS rollback_pct,
+    blks_read,
+    blks_hit,
+    tup_returned,
+    tup_fetched,
+    tup_inserted,
+    tup_updated,
+    tup_deleted,
+    conflicts,
+    deadlocks,
+    temp_files,
+    pg_size_pretty(temp_bytes) AS temp_bytes,
+    stats_reset
+FROM pg_stat_database
+WHERE datname = current_database();
+  datname   | connections |  commits  | rollbacks | rollback_pct | blks_read |   blks_hit   | tup_returned  | tup_fetched  | tup_inserted | tup_updated | tup_deleted | conflicts | deadlocks | temp_files | temp_bytes | stats_reset 
+------------+-------------+-----------+-----------+--------------+-----------+--------------+---------------+--------------+--------------+-------------+-------------+-----------+-----------+------------+------------+-------------
+ formunauts |          13 | 616816486 |     88105 |         0.01 | 590806636 | 184633969202 | 2374173981665 | 383549208624 |     26414022 |    46191099 |    20131800 |         0 |        34 |     249267 | 2507 GB    | 
+(1 row)
+
+-- ============================================================================
+-- SECTION 2: Query Performance (pg_stat_statements)
+-- ============================================================================
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 2: Query Performance Analysis'
+SECTION 2: Query Performance Analysis
+\echo '============================================================================'
+============================================================================
+-- 2.1 Top 15 by mean execution time
+\echo '-- 2.1 Top 15 slowest queries (by mean time)'
+-- 2.1 Top 15 slowest queries (by mean time)
+SELECT 
+    queryid,
+    LEFT(query, 80) AS query_preview,
+    calls,
+    ROUND((mean_time / 1000)::numeric, 3) AS mean_sec,
+    ROUND((total_time / 1000 / 60)::numeric, 2) AS total_min,
+    rows,
+    ROUND((100.0 * shared_blks_hit / NULLIF(shared_blks_hit + shared_blks_read, 0))::numeric, 2) AS cache_hit_pct
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND query NOT LIKE '%pg_stat%'
+  AND calls > 0
+ORDER BY mean_time DESC
+LIMIT 15;
+       queryid        |                                  query_preview                                   | calls | mean_sec | total_min |  rows   | cache_hit_pct 
+----------------------+----------------------------------------------------------------------------------+-------+----------+-----------+---------+---------------
+ -7902923237970965675 | SELECT $1 AS "a" FROM "bureau_donation" INNER JOIN "bureau_campaign" ON ("bureau |    27 |    2.324 |      1.05 |       0 |        100.00
+  1858010825889304822 | SELECT "nanny_fundraiserworkshiftlocation"."id", "nanny_fundraiserworkshiftlocat |   256 |    1.764 |      7.53 |     275 |        100.00
+  -729373177099854881 | SELECT COUNT(*) AS "__count" FROM "bureau_donation" INNER JOIN "bureau_campaign" |    41 |    1.324 |      0.90 |      41 |        100.00
+  7335334328110458048 | SELECT COUNT(*) AS "__count" FROM "bureau_donation" INNER JOIN "bureau_campaign" |    73 |    1.324 |      1.61 |      73 |        100.00
+ -3737897023406270216 | SELECT "nanny_fundraiser"."id", "nanny_fundraiser"."createtime", "nanny_fundrais |    10 |    1.231 |      0.21 |   20722 |        100.00
+ -2814985145835381367 | SELECT $1 AS "a" FROM "bureau_donation" INNER JOIN "bureau_campaign" ON ("bureau |   129 |    1.219 |      2.62 |       1 |        100.00
+  2519937978026500864 | SELECT $1 AS "a" FROM "bureau_donation" INNER JOIN "bureau_campaign" ON ("bureau |   129 |    1.196 |      2.57 |       0 |        100.00
+  8922495493500362301 | SELECT COUNT(*) AS "__count" FROM "bureau_donation" WHERE "bureau_donation"."fin |    60 |    1.192 |      1.19 |      60 |        100.00
+  1293333526736700888 | SELECT "bureau_donation"."id" AS "id" FROM "bureau_donation" WHERE ("bureau_dona |     7 |    1.053 |      0.12 |  237003 |        100.00
+  3292620456934418803 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" |   256 |    0.814 |      3.47 |     287 |         97.45
+  6001426020531635488 | SELECT "donut_organization"."id", "donut_organization"."createtime", "donut_orga |    97 |    0.713 |      1.15 |     873 |        100.00
+ -1169293326375541642 | SELECT "bureau_donationfeedback"."id" AS "id" FROM "bureau_donationfeedback" INN |    11 |    0.706 |      0.13 |  197670 |        100.00
+  5300835910804196897 | SELECT "bureau_donationfeedback"."id" AS "id" FROM "bureau_donationfeedback" INN |   136 |    0.694 |      1.57 | 1553256 |        100.00
+ -5985668835752659476 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" | 67752 |    0.686 |    774.36 |  895827 |        100.00
+ -1438819265414754542 | SELECT "bureau_location"."id", "bureau_location"."createtime", "bureau_location" |    30 |    0.676 |      0.34 |   82960 |        100.00
+(15 rows)
+
+-- 2.2 Top 15 by total execution time
+\echo '-- 2.2 Top 15 queries by total time (cumulative impact)'
+-- 2.2 Top 15 queries by total time (cumulative impact)
+SELECT 
+    queryid,
+    LEFT(query, 80) AS query_preview,
+    calls,
+    ROUND((total_time / 1000 / 60)::numeric, 2) AS total_min,
+    ROUND((mean_time / 1000)::numeric, 3) AS mean_sec,
+    ROUND((100.0 * total_time / NULLIF(SUM(total_time) OVER (), 0))::numeric, 2) AS pct_total_time
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND query NOT LIKE '%pg_stat%'
+ORDER BY total_time DESC
+LIMIT 15;
+       queryid        |                                  query_preview                                   |  calls  | total_min | mean_sec | pct_total_time 
+----------------------+----------------------------------------------------------------------------------+---------+-----------+----------+----------------
+  5670810822601916337 | SELECT COUNT(*) AS "__count" FROM "bureau_donation" INNER JOIN "bureau_campaign" |  144452 |   1060.02 |    0.440 |          23.32
+ -5985668835752659476 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" |   67752 |    774.36 |    0.686 |          17.03
+ -1819256432490723818 | SELECT $1 AS "a" FROM "gamification_userachievement" WHERE ("gamification_userac |  810142 |    620.39 |    0.046 |          13.65
+  2849199190152761533 | SELECT "raisenow_epmswebhook"."id", "raisenow_epmswebhook"."createtime", "raisen |  239941 |    505.31 |    0.126 |          11.12
+    90684422035062748 | SELECT "nanny_fundraiser"."id", "nanny_fundraiser"."createtime", "nanny_fundrais |   74657 |    189.80 |    0.153 |           4.18
+  -565942562483367784 | SELECT "oauth2_provider_accesstoken"."id", "oauth2_provider_accesstoken"."user_i |  235991 |    166.91 |    0.042 |           3.67
+  3761414683431718933 | SELECT "bureau_location"."id", "bureau_location"."createtime", "bureau_location" | 6188050 |    112.34 |    0.001 |           2.47
+  1442782186870431275 | SELECT "tracking_event"."id" FROM "tracking_event" WHERE ("tracking_event"."fund | 1183267 |    101.18 |    0.005 |           2.23
+  4882978984515387001 | UPDATE "bureau_donation" SET "modifytime" = $1::timestamptz, "mailjet_message_id |  493073 |     46.44 |    0.006 |           1.02
+ -1492997749586237697 | INSERT INTO "reversion_version" ("revision_id", "object_id", "content_type_id",  | 1739315 |     42.58 |    0.001 |           0.94
+  -439648924586459341 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" |    7951 |     34.88 |    0.263 |           0.77
+ -2107835835832210308 | UPDATE "django_session" SET "session_data" = $1, "expire_date" = $2::timestamptz | 8805897 |     26.32 |    0.000 |           0.58
+ -3171296077258171478 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" |  626786 |     23.70 |    0.002 |           0.52
+  7356494101571929826 | SELECT "bureau_donation"."id" FROM "bureau_donation" WHERE ("bureau_donation"."f | 1997053 |     23.69 |    0.001 |           0.52
+  3323176706724240224 | SELECT "nanny_team"."id", "nanny_team"."createtime", "nanny_team"."modifytime",  |   45151 |     22.81 |    0.030 |           0.50
+(15 rows)
+
+-- 2.3 Top 15 by number of calls
+\echo '-- 2.3 Top 15 most frequently called queries'
+-- 2.3 Top 15 most frequently called queries
+SELECT 
+    queryid,
+    LEFT(query, 80) AS query_preview,
+    calls,
+    ROUND((mean_time)::numeric, 2) AS mean_ms,
+    ROUND((total_time / 1000 / 60)::numeric, 2) AS total_min,
+    rows,
+    ROUND(rows::numeric / NULLIF(calls, 0), 2) AS avg_rows_per_call
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND query NOT LIKE '%pg_stat%'
+ORDER BY calls DESC
+LIMIT 15;
+       queryid        |                                  query_preview                                   |  calls   | mean_ms | total_min |   rows   | avg_rows_per_call 
+----------------------+----------------------------------------------------------------------------------+----------+---------+-----------+----------+-------------------
+  2813945726541340933 | SELECT "bureau_campaignpaymentintervalconfig"."id", "bureau_campaignpaymentinter | 63500174 |    0.02 |     16.39 | 63484687 |              1.00
+ -8971667887968998946 | SELECT "django_content_type"."id", "django_content_type"."app_label", "django_co | 21844433 |    0.02 |      8.55 | 21844433 |              1.00
+  3707913398879730646 | SELECT "auth_group"."name" FROM "auth_group" INNER JOIN "donut_user_groups" ON ( | 18053917 |    0.03 |      7.89 | 25867477 |              1.43
+  2577568268712660415 | BEGIN                                                                            | 16691302 |    0.00 |      0.84 |        0 |              0.00
+  3011969929929835837 | COMMIT                                                                           | 16618733 |    0.00 |      0.57 |        0 |              0.00
+  8470841600214436385 | SELECT $1 AS "a" FROM "gamification_userachievement" WHERE ("gamification_userac | 15999934 |    0.02 |      4.06 |   113560 |              0.01
+  6169751779623992611 | SELECT COUNT(*) AS "__count" FROM "bureau_donation" WHERE ("bureau_donation"."fi | 14739585 |    0.06 |     15.43 | 14739585 |              1.00
+  3603029219238699787 | SELECT "bureau_locationpermit"."id", "bureau_locationpermit"."createtime", "bure | 14175702 |    0.01 |      2.03 |     4494 |              0.00
+ -1225972459202590826 | SELECT "bureau_campaignadditionalradiobutton_translation"."id", "bureau_campaign | 13986610 |    0.01 |      3.19 | 15575412 |              1.11
+  7227471222576064961 | SELECT DISTINCT "taggit_tag"."id", "taggit_tag"."createtime", "taggit_tag"."modi | 13852123 |    0.08 |     17.57 | 13344023 |              0.96
+ -6452368555997630176 | SELECT "donut_user"."id", "donut_user"."password", "donut_user"."last_login", "d | 13717999 |    0.03 |      7.10 | 13717924 |              1.00
+  1962989717639465799 | SELECT "oauth2_provider_accesstoken"."id", "oauth2_provider_accesstoken"."user_i | 13286478 |    0.07 |     14.71 | 13078553 |              0.98
+  6287916933075071626 | SELECT $1 AS "a" FROM "gamification_userachievement" WHERE ("gamification_userac | 13098077 |    0.07 |     14.51 |  5059907 |              0.39
+  1589856579853595114 | SELECT "nanny_fundraiserworkshift"."id", "nanny_fundraiserworkshift"."createtime | 12516965 |    0.03 |      5.44 | 12516878 |              1.00
+  6171118189970066995 | SELECT "bureau_campaignpaymentintervalconfig"."id", "bureau_campaignpaymentinter | 11851719 |    0.01 |      2.37 | 11851719 |              1.00
+(15 rows)
+
+-- 2.4 Queries using temp files
+\echo '-- 2.4 Queries using temp files (memory pressure)'
+-- 2.4 Queries using temp files (memory pressure)
+SELECT 
+    queryid,
+    LEFT(query, 80) AS query_preview,
+    calls,
+    temp_blks_read,
+    temp_blks_written,
+    pg_size_pretty((temp_blks_written * 8192)::bigint) AS temp_written,
+    ROUND((mean_time / 1000)::numeric, 3) AS mean_sec
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND temp_blks_written > 0
+ORDER BY temp_blks_written DESC
+LIMIT 15;
+       queryid        |                                  query_preview                                   | calls | temp_blks_read | temp_blks_written | temp_written | mean_sec 
+----------------------+----------------------------------------------------------------------------------+-------+----------------+-------------------+--------------+----------
+    90684422035062748 | SELECT "nanny_fundraiser"."id", "nanny_fundraiser"."createtime", "nanny_fundrais | 74657 |       99687480 |         133329110 | 1017 GB      |    0.153
+ -5985668835752659476 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" | 67752 |       10444003 |          11269694 | 86 GB        |    0.686
+ -4983899007643508775 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" |   578 |         165549 |            289019 | 2258 MB      |    0.176
+ -8394343947122051812 | SELECT "bureau_donation"."id" AS "id" FROM "bureau_donation" WHERE ("bureau_dona |  1921 |          15101 |             15126 | 118 MB       |    0.133
+ -1000542638641792443 | SELECT                                                                          +|     1 |           7224 |              5467 | 43 MB        |    0.276
+                      |     queryid,                                                                    +|       |                |                   |              | 
+                      |     LEFT(query, $1) AS query_preview,                                           +|       |                |                   |              | 
+                      |     calls,                                                                      +|       |                |                   |              | 
+                      |     ROUND(                                                                       |       |                |                   |              | 
+  7222305374616902609 | SELECT                                                                          +|     1 |           2776 |              2776 | 22 MB        |    0.197
+                      |     queryid,                                                                    +|       |                |                   |              | 
+                      |     LEFT(query, $1) AS query_preview,                                           +|       |                |                   |              | 
+                      |     calls,                                                                      +|       |                |                   |              | 
+                      |     ROUND(                                                                       |       |                |                   |              | 
+  3623783095131157439 | SELECT                                                                          +|     1 |           2776 |              2776 | 22 MB        |    0.184
+                      |     queryid,                                                                    +|       |                |                   |              | 
+                      |     LEFT(query, $1) AS query_preview,                                           +|       |                |                   |              | 
+                      |     calls,                                                                      +|       |                |                   |              | 
+                      |     ROUND(                                                                       |       |                |                   |              | 
+ -3747569389873524366 | FETCH FORWARD 2000 FROM "_django_curs_139958519790528_sync_1661"                 |     8 |           1085 |                 1 | 8192 bytes   |    0.001
+  7277118177252415401 | FETCH FORWARD 2000 FROM "_django_curs_139850618166208_sync_1534"                 |     7 |           1085 |                 1 | 8192 bytes   |    0.001
+ -7580140158699641872 | FETCH FORWARD 2000 FROM "_django_curs_140463348198336_sync_1515"                 |     7 |           1085 |                 1 | 8192 bytes   |    0.001
+  1263219653617874862 | FETCH FORWARD 2000 FROM "_django_curs_140463348198336_sync_1559"                 |     7 |           1085 |                 1 | 8192 bytes   |    0.001
+  4635772088634751373 | FETCH FORWARD 2000 FROM "_django_curs_139650468146112_sync_1500"                 |     7 |           1085 |                 1 | 8192 bytes   |    0.001
+  6015692519416371926 | FETCH FORWARD 2000 FROM "_django_curs_139650468146112_sync_1388"                 |     8 |           1085 |                 1 | 8192 bytes   |    0.001
+ -1228721928875602626 | FETCH FORWARD 2000 FROM "_django_curs_139850618166208_sync_1530"                 |     7 |           1085 |                 1 | 8192 bytes   |    0.001
+ -2804647448628278231 | FETCH FORWARD 2000 FROM "_django_curs_139850618166208_sync_1555"                 |     7 |           1085 |                 1 | 8192 bytes   |    0.001
+(15 rows)
+
+-- 2.5 Queries with poor cache hit ratio
+\echo '-- 2.5 Queries with poor cache hit ratio (<90%)'
+-- 2.5 Queries with poor cache hit ratio (<90%)
+SELECT 
+    queryid,
+    LEFT(query, 80) AS query_preview,
+    calls,
+    shared_blks_read,
+    shared_blks_hit,
+    ROUND((100.0 * shared_blks_hit / NULLIF(shared_blks_hit + shared_blks_read, 0))::numeric, 2) AS cache_hit_pct,
+    ROUND((mean_time / 1000)::numeric, 3) AS mean_sec
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND (shared_blks_hit + shared_blks_read) > 1000
+  AND shared_blks_hit::float / NULLIF(shared_blks_hit + shared_blks_read, 0) < 0.90
+ORDER BY shared_blks_read DESC
+LIMIT 15;
+       queryid        |                                  query_preview                                   | calls  | shared_blks_read | shared_blks_hit | cache_hit_pct | mean_sec 
+----------------------+----------------------------------------------------------------------------------+--------+------------------+-----------------+---------------+----------
+ -5802185960682758782 | FETCH 100 FROM c1                                                                | 839536 |           404413 |         3102175 |         88.47 |    0.000
+  -999785395161026162 | SELECT $1 AS "a" FROM "bureau_donation" WHERE ("bureau_donation"."finished_at" I |  28246 |            16083 |           97416 |         85.83 |    0.001
+  -234403219961251161 | UPDATE "axes_accesslog" SET "logout_time" = $1::timestamptz WHERE ("axes_accessl |     36 |             4064 |            6174 |         60.30 |    0.008
+ -3051256205274461993 | INSERT INTO "thumbnail_kvstore" ("key", "value") VALUES ($1, $2)                 |   1906 |             2278 |           12205 |         84.27 |    0.001
+  2646981051201080600 | SELECT "thumbnail_kvstore"."key", "thumbnail_kvstore"."value" FROM "thumbnail_kv |   4281 |             1887 |           11398 |         85.80 |    0.000
+  1986923383655479497 | SELECT $1 AS "a" FROM "bureau_unfinisheddonation" WHERE "bureau_unfinisheddonati |   1312 |             1115 |            2841 |         71.81 |    0.001
+  -149939567516614243 | SELECT $1 AS "a" FROM "bureau_donation" WHERE ("bureau_donation"."finished_at" I |   2825 |             1091 |            7384 |         87.13 |    0.000
+  7343429098743904460 | SELECT $1 AS "a" FROM "bureau_unfinisheddonation" WHERE "bureau_unfinisheddonati |    799 |              471 |            1926 |         80.35 |    0.001
+ -6472169667969185436 | SELECT "nanny_team"."id", "nanny_team"."createtime", "nanny_team"."modifytime",  |    151 |              346 |            2999 |         89.66 |    0.003
+(9 rows)
+
+-- 2.6 Queries with high variance (unstable performance)
+\echo '-- 2.6 Queries with high variance (unstable performance)'
+-- 2.6 Queries with high variance (unstable performance)
+SELECT 
+    queryid,
+    LEFT(query, 80) AS query_preview,
+    calls,
+    ROUND(mean_time::numeric, 2) AS mean_ms,
+    ROUND(stddev_time::numeric, 2) AS stddev_ms,
+    ROUND((stddev_time / NULLIF(mean_time, 0))::numeric, 2) AS coeff_variation,
+    ROUND(min_time::numeric, 2) AS min_ms,
+    ROUND(max_time::numeric, 2) AS max_ms
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND calls > 100
+  AND mean_time > 10
+  AND stddev_time / NULLIF(mean_time, 0) > 1
+ORDER BY (stddev_time / NULLIF(mean_time, 0)) DESC
+LIMIT 15;
+       queryid        |                                  query_preview                                   | calls  | mean_ms | stddev_ms | coeff_variation | min_ms |  max_ms  
+----------------------+----------------------------------------------------------------------------------+--------+---------+-----------+-----------------+--------+----------
+  6097217991162940103 | SELECT "nanny_jobapplication"."id", "nanny_jobapplication"."createtime", "nanny_ |    256 |   12.84 |     97.10 |            7.56 |   0.06 |  1508.44
+ -4712785496760931173 | SELECT "bureau_unfinisheddonation"."id", "bureau_unfinisheddonation"."createtime |    169 |   14.01 |     71.77 |            5.12 |   0.16 |   430.93
+ -8208751752408563709 | SELECT COALESCE(SUM("bureau_sms"."part_count"), $1) AS "total_sms_sent" FROM "bu |   1507 |   12.80 |     64.15 |            5.01 |   0.01 |  1541.20
+  3292620456934418803 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" |    256 |  813.52 |   3674.03 |            4.52 |   0.11 | 43915.78
+  1172380095173804681 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" |   1496 |  217.44 |    845.40 |            3.89 |   0.04 |  5789.97
+  8446617438329978672 | SELECT "bureau_unfinisheddonation"."id", "bureau_unfinisheddonation"."createtime |   3080 |   22.99 |     86.77 |            3.77 |   0.02 |   686.76
+  2723149867400938189 | SELECT "tracking_event"."id", "tracking_event"."createtime", "tracking_event"."m |   7005 |   30.17 |    105.66 |            3.50 |   0.01 |  2413.57
+  1858010825889304822 | SELECT "nanny_fundraiserworkshiftlocation"."id", "nanny_fundraiserworkshiftlocat |    256 | 1763.85 |   3209.32 |            1.82 |   4.71 | 13790.42
+ -1845447798928195978 | SELECT COUNT(*) AS "__count" FROM "bureau_donation" WHERE ("bureau_donation"."fi |   2516 |  166.64 |    284.81 |            1.71 |   0.20 |  2494.55
+  4208186588442728421 | SELECT COUNT(*) AS "__count" FROM "bureau_donation" WHERE ("bureau_donation"."fi |   2516 |  167.29 |    276.82 |            1.65 |   0.26 |  2520.78
+  5670810822601916337 | SELECT COUNT(*) AS "__count" FROM "bureau_donation" INNER JOIN "bureau_campaign" | 144452 |  440.29 |    679.68 |            1.54 |   0.01 | 40129.43
+ -5975387316641634905 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" |   2189 |   12.24 |     18.05 |            1.47 |   3.13 |   208.14
+  1464617488672900614 | SELECT "bureau_donation"."id", "bureau_donation"."createtime", "bureau_donation" |   3163 |  232.11 |    336.78 |            1.45 |   0.53 |  3658.84
+ -7859683370019080953 | SELECT COUNT(*) AS "__count" FROM "bureau_donation" INNER JOIN "bureau_campaign" |    751 |   15.96 |     19.44 |            1.22 |   0.96 |   188.25
+  2555932344069910245 | UPDATE "bureau_donation" SET "createtime" = $1::timestamptz, "modifytime" = $2:: |    169 |   12.63 |     14.65 |            1.16 |   2.06 |   130.66
+(15 rows)
+
+-- 2.7 Write-heavy queries
+\echo '-- 2.7 Write-heavy queries (shared blocks dirtied)'
+-- 2.7 Write-heavy queries (shared blocks dirtied)
+SELECT 
+    queryid,
+    LEFT(query, 80) AS query_preview,
+    calls,
+    shared_blks_dirtied,
+    shared_blks_written,
+    pg_size_pretty((shared_blks_dirtied * 8192)::bigint) AS data_dirtied,
+    ROUND((mean_time / 1000)::numeric, 3) AS mean_sec
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND shared_blks_dirtied > 1000
+ORDER BY shared_blks_dirtied DESC
+LIMIT 15;
+ queryid | query_preview | calls | shared_blks_dirtied | shared_blks_written | data_dirtied | mean_sec 
+---------+---------------+-------+---------------------+---------------------+--------------+----------
+(0 rows)
+
+-- ============================================================================
+-- SECTION 3: Index Analysis
+-- ============================================================================
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 3: Index Analysis'
+SECTION 3: Index Analysis
+\echo '============================================================================'
+============================================================================
+-- 3.1 Index usage overview
+\echo '-- 3.1 Index usage overview'
+-- 3.1 Index usage overview
+SELECT 
+    'Total Indexes' AS metric,
+    count(*)::text AS value
+FROM pg_stat_user_indexes
+UNION ALL
+SELECT 'Unused Indexes (0 scans)', count(*)::text
+FROM pg_stat_user_indexes WHERE idx_scan = 0
+UNION ALL
+SELECT 'Rarely Used (<100 scans)', count(*)::text
+FROM pg_stat_user_indexes WHERE idx_scan > 0 AND idx_scan < 100
+UNION ALL
+SELECT 'Total Index Size', pg_size_pretty(sum(pg_relation_size(indexrelid)))
+FROM pg_stat_user_indexes
+UNION ALL
+SELECT 'Unused Index Size', pg_size_pretty(sum(pg_relation_size(indexrelid)))
+FROM pg_stat_user_indexes WHERE idx_scan = 0;
+          metric          |  value  
+--------------------------+---------
+ Total Indexes            | 1254
+ Unused Indexes (0 scans) | 515
+ Rarely Used (<100 scans) | 120
+ Total Index Size         | 18 GB
+ Unused Index Size        | 3651 MB
+(5 rows)
+
+-- 3.2 Zero-efficiency indexes
+\echo '-- 3.2 Zero-efficiency indexes (reads but no fetches)'
+-- 3.2 Zero-efficiency indexes (reads but no fetches)
+SELECT 
+    schemaname,
+    relname AS table_name,
+    indexrelname AS index_name,
+    idx_scan AS scans,
+    idx_tup_read AS tuples_read,
+    idx_tup_fetch AS tuples_fetched,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    'Index scans data but never returns useful rows' AS issue
+FROM pg_stat_user_indexes
+WHERE idx_tup_read > 10000
+  AND idx_tup_fetch = 0
+ORDER BY idx_tup_read DESC
+LIMIT 20;
+ schemaname |               table_name               |                        index_name                         |  scans   | tuples_read  | tuples_fetched | index_size |                     issue                      
+------------+----------------------------------------+-----------------------------------------------------------+----------+--------------+----------------+------------+------------------------------------------------
+ public     | bureau_recordexporthistory             | bureau_recordexporthistory_retrieval_status_98dde4c3_like |  4739615 | 256945124818 |              0 | 193 MB     | Index scans data but never returns useful rows
+ public     | bureau_donation                        | bureau_donation__consent_given_5e242be9                   |    34687 |   5191348193 |              0 | 23 MB      | Index scans data but never returns useful rows
+ public     | gamification_userachievement           | gamification_userachievement_ed287dcc                     |   166275 |   4893493458 |              0 | 17 MB      | Index scans data but never returns useful rows
+ public     | bureau_recordexporthistory             | bureau_recordexporthistory_application_id_ea78ada5        |    65694 |   4370546458 |              0 | 220 MB     | Index scans data but never returns useful rows
+ public     | donut_odometercount                    | donut_odometercount_fba3196d                              |    30628 |   4295481556 |              0 | 91 MB      | Index scans data but never returns useful rows
+ public     | bureau_unfinisheddonation              | bureau_unfinisheddonation_anonymized_at_ec2ad319          |   209235 |   4122245782 |              0 | 2528 kB    | Index scans data but never returns useful rows
+ public     | bureau_donation                        | bureau_donation_raisenow_status_82127d4c_like             |     6462 |    270543362 |              0 | 19 MB      | Index scans data but never returns useful rows
+ public     | bureau_petition                        | bureau_petition_campaign_id                               |    21111 |    147578614 |              0 | 1024 kB    | Index scans data but never returns useful rows
+ public     | bureau_campaignadditionalcheckboxgroup | campaign_additional_checkbox_group_key_unique             | 20955542 |     67218256 |              0 | 216 kB     | Index scans data but never returns useful rows
+ public     | gamification_achievement               | gamification_achievement_linked_model_id_37a2951f         |   177518 |     21747049 |              0 | 64 kB      | Index scans data but never returns useful rows
+ public     | bureau_donation                        | bureau_donation_mailjet_status_8cc3c334_like              |      224 |     12687478 |              0 | 20 MB      | Index scans data but never returns useful rows
+ public     | bureau_donation                        | bureau_donation_status_charity_85342ae0_like              |      194 |     12618953 |              0 | 19 MB      | Index scans data but never returns useful rows
+ public     | axes_accesslog                         | axes_accesslog_username_df93064b_like                     |    20826 |     11520340 |              0 | 6392 kB    | Index scans data but never returns useful rows
+ public     | auth_group_permissions                 | auth_group_permissions_group_id                           | 11167960 |     11167960 |              0 | 80 kB      | Index scans data but never returns useful rows
+ public     | spatial_ref_sys                        | spatial_ref_sys_pkey                                      |     3164 |      9232326 |              0 | 272 kB     | Index scans data but never returns useful rows
+ public     | bureau_donation                        | bureau_donation_status_agency_d435cac5_like               |      160 |      6684842 |              0 | 19 MB      | Index scans data but never returns useful rows
+ public     | donut_webrequest                       | donut_webrequest_path_96f88408_like                       |    18049 |      5539219 |              0 | 123 MB     | Index scans data but never returns useful rows
+ public     | bureau_donation                        | bureau_donation_self_checkout_journey_23388d4d_like       |      144 |      2538924 |              0 | 19 MB      | Index scans data but never returns useful rows
+ public     | bureau_academictitleconfig_translation | bureau_academictitleconfig_translation_60716c2f           |     2117 |       414293 |              0 | 192 kB     | Index scans data but never returns useful rows
+ public     | api_webhookconfiguration               | api_webhookconfiguration_customer_id_0b024bcd             |   351249 |       351226 |              0 | 16 kB      | Index scans data but never returns useful rows
+(20 rows)
+
+-- 3.3 Low-efficiency indexes
+\echo '-- 3.3 Low-efficiency indexes (< 10% fetch ratio)'
+-- 3.3 Low-efficiency indexes (< 10% fetch ratio)
+SELECT 
+    schemaname,
+    relname AS table_name,
+    indexrelname AS index_name,
+    idx_scan AS scans,
+    idx_tup_read AS tuples_read,
+    idx_tup_fetch AS tuples_fetched,
+    ROUND(100.0 * idx_tup_fetch / idx_tup_read, 2) AS efficiency_pct,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+FROM pg_stat_user_indexes
+WHERE idx_tup_read > 100000
+  AND idx_tup_fetch::float / NULLIF(idx_tup_read, 0) < 0.10
+  AND idx_tup_fetch > 0
+ORDER BY idx_tup_read DESC
+LIMIT 20;
+ schemaname |                  table_name                   |                           index_name                            |   scans    | tuples_read  | tuples_fetched | efficiency_pct | index_size 
+------------+-----------------------------------------------+-----------------------------------------------------------------+------------+--------------+----------------+----------------+------------
+ public     | bureau_donation                               | bureau_donation_anonymized_at_07aff326                          |    2334569 | 373525696456 |      716953443 |           0.19 | 57 MB
+ public     | trainingcenter_quizattempt                    | trainingcenter_quizattempt_assigning_quiz_group_id_ea6abeba     |   10234959 |  13768211798 |          68665 |           0.00 | 1248 kB
+ public     | nanny_fundraiserworkshift_photo_verifications | nanny_fundraiserworkshif_fundraiserworkshift_id_f_db3e24bd_uniq | 5709636783 |  11048209394 |      134834642 |           1.22 | 3152 kB
+ public     | bureau_donation                               | bureau_donation_fundraiser_id                                   |   22646033 |   7958272561 |         572613 |           0.01 | 20 MB
+ public     | donut_webrequest                              | donut_webrequest_user_id                                        |     305524 |   4826385529 |        2379388 |           0.05 | 76 MB
+ public     | gamification_userachievement                  | achievement_awarded_for_object_id_awarded_for_content_type_uniq |   35524236 |   4307728740 |         600198 |           0.01 | 17 MB
+ public     | donut_webrequest                              | donut_webrequest_path_96f88408                                  |     138018 |   3805791434 |         718268 |           0.02 | 118 MB
+ public     | bureau_donation                               | bureau_donation_callcenter_file_id_df2816cc                     |      20107 |   3764892588 |         748757 |           0.02 | 19 MB
+ public     | nanny_team_campaigns                          | nanny_team_campaigns_team_id_campaign_id_68cb8a4b_uniq          |  238407821 |   3636337981 |       53183712 |           1.46 | 2752 kB
+ public     | bureau_donation                               | bureau_donation_status_f571663a_like                            |     100337 |   3353498192 |             80 |           0.00 | 19 MB
+ public     | nanny_team_assistant_coaches                  | nanny_team_coaches_team_id_5897c14d9e8b918b_uniq                |  194713434 |   2939628069 |       36356518 |           1.24 | 1776 kB
+ public     | gamification_userachievement                  | gamification_userachievement_e8701ad4                           |   22856647 |   2794680713 |      191329938 |           6.85 | 18 MB
+ public     | bureau_recordexporthistory                    | bureau_recordexporthistory_exported_at_d4db3eb5                 |      68979 |   2488801947 |       39313629 |           1.58 | 564 MB
+ public     | nanny_fundraiserworkshift                     | fundraiser_date_unique                                          |   33748969 |   1991632169 |       64872120 |           3.26 | 40 MB
+ public     | trainingcenter_quizattempt                    | trainingcenter_quizattempt_quiz_id_66300990                     |    1249052 |   1910666939 |          52727 |           0.00 | 1296 kB
+ public     | django_admin_log                              | django_admin_log_content_type_id                                |      68923 |   1616527773 |           2311 |           0.00 | 96 MB
+ public     | donut_user_groups                             | donut_user_groups_user_id_573b2ada7d51cafd_uniq                 |   23839186 |   1468359395 |       33574749 |           2.29 | 2368 kB
+ public     | nanny_fundraiser                              | nanny_fundraiser_is_deleted_f8c52eea                            |      21245 |   1108846444 |        4596282 |           0.41 | 520 kB
+ public     | gamification_userachievement                  | gamification_userachievement_createtime_32eb9a5d                |   17698577 |   1019750739 |       15487418 |           1.52 | 17 MB
+ public     | bureau_sms                                    | bureau_sms_cb24373b                                             |     105575 |    970138222 |       20002278 |           2.06 | 54 MB
+(20 rows)
+
+-- 3.4 Unused indexes (candidates for removal)
+\echo '-- 3.4 Unused indexes (0 scans, > 1 MB) - DROP candidates'
+-- 3.4 Unused indexes (0 scans, > 1 MB) - DROP candidates
+SELECT 
+    ui.schemaname,
+    ui.relname AS table_name,
+    ui.indexrelname AS index_name,
+    ui.idx_scan,
+    pg_size_pretty(pg_relation_size(ui.indexrelid)) AS index_size,
+    pg_relation_size(ui.indexrelid) AS size_bytes,
+    CASE 
+        WHEN i.indisprimary THEN '🔴 PRIMARY KEY - DO NOT DROP'
+        WHEN i.indisunique THEN '🟠 UNIQUE - verify constraints before drop'
+        ELSE '🟢 Safe to DROP'
+    END AS recommendation
+FROM pg_stat_user_indexes ui
+JOIN pg_index i ON ui.indexrelid = i.indexrelid
+WHERE ui.idx_scan = 0
+  AND pg_relation_size(ui.indexrelid) > 1 * 1024 * 1024
+ORDER BY pg_relation_size(ui.indexrelid) DESC
+LIMIT 30;
+ schemaname |                table_name                 |                          index_name                           | idx_scan | index_size | size_bytes |               recommendation               
+------------+-------------------------------------------+---------------------------------------------------------------+----------+------------+------------+--------------------------------------------
+ public     | tracking_event                            | tracking_event_name_173b6385_like                             |        0 | 528 MB     |  553820160 | 🟢 Safe to DROP
+ public     | tracking_event                            | tracking_event_name_173b6385                                  |        0 | 528 MB     |  553615360 | 🟢 Safe to DROP
+ public     | tracking_event                            | tracking_event_createtime_abc4b470                            |        0 | 240 MB     |  251387904 | 🟢 Safe to DROP
+ public     | actstream_action                          | actstream_action_verb_83f768b7                                |        0 | 132 MB     |  138510336 | 🟢 Safe to DROP
+ public     | actstream_action                          | actstream_action_verb_83f768b7_like                           |        0 | 132 MB     |  138125312 | 🟢 Safe to DROP
+ public     | bureau_paymentattempt                     | bureau_paymentattempt_createtime_fb9d3495                     |        0 | 131 MB     |  137134080 | 🟢 Safe to DROP
+ public     | bureau_donation                           | bureau_donation_hash_f7fc7b63_uniq                            |        0 | 127 MB     |  133349376 | 🟠 UNIQUE - verify constraints before drop
+ public     | oauth2_provider_accesstoken               | oauth2_provider_accesstoken_id_token_id_key                   |        0 | 104 MB     |  109223936 | 🟠 UNIQUE - verify constraints before drop
+ public     | bureau_donation                           | bureau_donation_mailjet_message_id_a2dba5d8_like              |        0 | 96 MB      |  100859904 | 🟢 Safe to DROP
+ public     | oauth2_provider_refreshtoken              | oauth2_provider_refreshtoken_6bc0a4eb                         |        0 | 96 MB      |  100352000 | 🟢 Safe to DROP
+ public     | donut_odometercount                       | donut_odome_campaig_081865_idx                                |        0 | 92 MB      |   96321536 | 🟢 Safe to DROP
+ public     | donut_odometercount                       | donut_odometercount_00eb2274                                  |        0 | 92 MB      |   95952896 | 🟢 Safe to DROP
+ public     | actstream_action                          | actstream_action_actor_object_id_72ef0cfa_like                |        0 | 86 MB      |   89939968 | 🟢 Safe to DROP
+ public     | actstream_action                          | actstream_action_public_ac0653e9                              |        0 | 82 MB      |   86302720 | 🟢 Safe to DROP
+ public     | actstream_action                          | actstream_action_action_object_object_id_6433bdf7_like        |        0 | 82 MB      |   86040576 | 🟢 Safe to DROP
+ public     | actstream_action                          | actstream_action_action_object_object_id_6433bdf7             |        0 | 82 MB      |   85884928 | 🟢 Safe to DROP
+ public     | donut_odometercount                       | donut_odometercount_pkey                                      |        0 | 72 MB      |   76013568 | 🔴 PRIMARY KEY - DO NOT DROP
+ public     | donut_odometercount                       | donut_odometercount_createtime_31141ed9                       |        0 | 72 MB      |   75988992 | 🟢 Safe to DROP
+ public     | oauth2_provider_accesstoken               | oauth2_provider_accesstoken_token_checksum_85319a26_uniq      |        0 | 65 MB      |   68255744 | 🟠 UNIQUE - verify constraints before drop
+ public     | thumbnail_kvstore                         | thumbnail_kvstore_pkey                                        |        0 | 56 MB      |   58908672 | 🔴 PRIMARY KEY - DO NOT DROP
+ public     | bureau_donation                           | bureau_donation_uid_3e101b71e34b3bdc_uniq                     |        0 | 55 MB      |   57614336 | 🟠 UNIQUE - verify constraints before drop
+ public     | bureau_sms                                | bureau_sms_00eb2274                                           |        0 | 54 MB      |   56745984 | 🟢 Safe to DROP
+ public     | raisenow_epmswebhook                      | raisenow_epmswebhook_event_id_key                             |        0 | 45 MB      |   47226880 | 🟠 UNIQUE - verify constraints before drop
+ public     | nanny_fundraiserworkshift                 | nanny_fundraiserworkshift_createtime_c43c9641                 |        0 | 45 MB      |   47144960 | 🟢 Safe to DROP
+ public     | raisenow_epmswebhook                      | raisenow_epmswebhook_event_id_206245a0_like                   |        0 | 44 MB      |   46440448 | 🟢 Safe to DROP
+ public     | bureau_sms                                | bureau_sms_createtime_db256505                                |        0 | 42 MB      |   43638784 | 🟢 Safe to DROP
+ public     | nanny_donationcampaignfundraiserworkshift | nanny_donationcampaignfundraiserworkshift_createtime_2e38a9e5 |        0 | 36 MB      |   38174720 | 🟢 Safe to DROP
+ public     | bureau_donation                           | bureau_donation_raisenow_epp_transaction_id_c7002668_like     |        0 | 36 MB      |   37740544 | 🟢 Safe to DROP
+ public     | bureau_donation                           | bureau_donation_fallback_mailjet_message_id_e912f78c_like     |        0 | 26 MB      |   27303936 | 🟢 Safe to DROP
+ public     | bureau_donation                           | bureau_donation_raisenow_subscription_uuid_0cd11263_like      |        0 | 26 MB      |   27025408 | 🟢 Safe to DROP
+(30 rows)
+
+-- 3.5 Duplicate/Covered indexes
+\echo '-- 3.5 Duplicate/Covered indexes (wasted space)'
+-- 3.5 Duplicate/Covered indexes (wasted space)
+WITH index_cols AS (
+    SELECT 
+        i.indexrelid,
+        i.indrelid,
+        i.indisprimary,
+        i.indisunique,
+        n.nspname AS schema_name,
+        t.relname AS table_name,
+        idx.relname AS index_name,
+        array_agg(a.attname ORDER BY array_position(i.indkey, a.attnum)) AS columns,
+        pg_relation_size(i.indexrelid) AS index_size
+    FROM pg_index i
+    JOIN pg_class idx ON idx.oid = i.indexrelid
+    JOIN pg_class t ON t.oid = i.indrelid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+    GROUP BY i.indexrelid, i.indrelid, i.indisprimary, i.indisunique, n.nspname, t.relname, idx.relname
+)
+SELECT 
+    a.schema_name,
+    a.table_name,
+    a.index_name AS redundant_index,
+    b.index_name AS covered_by_index,
+    a.columns AS redundant_columns,
+    b.columns AS covering_columns,
+    pg_size_pretty(a.index_size) AS redundant_size,
+    CASE 
+        WHEN a.indisprimary THEN '🔴 PRIMARY KEY'
+        WHEN a.indisunique THEN '🟠 UNIQUE'
+        ELSE '🟢 Can DROP: ' || a.index_name
+    END AS action
+FROM index_cols a
+JOIN index_cols b ON a.indrelid = b.indrelid 
+    AND a.indexrelid != b.indexrelid
+    AND a.columns <@ b.columns
+    AND array_length(a.columns, 1) < array_length(b.columns, 1)
+ORDER BY a.index_size DESC
+LIMIT 20;
+ schema_name |                  table_name                   |                         redundant_index                         |                        covered_by_index                         |               redundant_columns               |                                         covering_columns                                          | redundant_size |                                    action                                    
+-------------+-----------------------------------------------+-----------------------------------------------------------------+-----------------------------------------------------------------+-----------------------------------------------+---------------------------------------------------------------------------------------------------+----------------+------------------------------------------------------------------------------
+ public      | nanny_team_locations                          | nanny_team_locations_f6a7ca40                                   | nanny_team_locations_team_id_location_id_key                    | {team_id}                                     | {team_id,location_id}                                                                             | 339 MB         | 🟢 Can DROP: nanny_team_locations_f6a7ca40
+ public      | nanny_team_locations                          | nanny_team_locations_e274a5da                                   | nanny_team_locations_team_id_location_id_key                    | {location_id}                                 | {team_id,location_id}                                                                             | 262 MB         | 🟢 Can DROP: nanny_team_locations_e274a5da
+ public      | bureau_recordexporthistory                    | bureau_recordexporthistory_content_type_id_a1781312             | bureau_reco_content_e898cc_idx                                  | {content_type_id}                             | {content_type_id,object_id}                                                                       | 187 MB         | 🟢 Can DROP: bureau_recordexporthistory_content_type_id_a1781312
+ public      | bureau_donation_form_additional_radio_buttons | bureau_donation_form_additional_radio_buttons_e05c25f0          | bureau_donation_form_addition_donation_id_formradiobutton_i_key | {campaignadditionalradiobutton_id}            | {donation_id,campaignadditionalradiobutton_id}                                                    | 132 MB         | 🟢 Can DROP: bureau_donation_form_additional_radio_buttons_e05c25f0
+ public      | bureau_donation_form_additional_checkboxes    | bureau_donation_form_additional_checkboxes_campaignadditionc157 | bureau_donation_form_addition_donation_id_7a29e0d898bfcad2_uniq | {campaignadditionalcheckbox_id}               | {donation_id,campaignadditionalcheckbox_id}                                                       | 119 MB         | 🟢 Can DROP: bureau_donation_form_additional_checkboxes_campaignadditionc157
+ public      | bureau_donation_form_additional_radio_buttons | bureau_donation_form_additional_radio_buttons_0e1b7e27          | bureau_donation_form_addition_donation_id_formradiobutton_i_key | {donation_id}                                 | {donation_id,campaignadditionalradiobutton_id}                                                    | 112 MB         | 🟢 Can DROP: bureau_donation_form_additional_radio_buttons_0e1b7e27
+ public      | donut_odometercount                           | donut_odome_campaig_081865_idx                                  | customer_campaign_content_type_campaign_object_id_object_conten | {campaign_content_type_id,campaign_object_id} | {customer_id,campaign_content_type_id,campaign_object_id,object_content_type_id,object_object_id} | 92 MB          | 🟢 Can DROP: donut_odome_campaig_081865_idx
+ public      | donut_odometercount                           | donut_odometercount_00eb2274                                    | donut_odome_campaig_081865_idx                                  | {campaign_content_type_id}                    | {campaign_content_type_id,campaign_object_id}                                                     | 92 MB          | 🟢 Can DROP: donut_odometercount_00eb2274
+ public      | donut_odometercount                           | donut_odometercount_00eb2274                                    | customer_campaign_content_type_campaign_object_id_object_conten | {campaign_content_type_id}                    | {customer_id,campaign_content_type_id,campaign_object_id,object_content_type_id,object_object_id} | 92 MB          | 🟢 Can DROP: donut_odometercount_00eb2274
+ public      | donut_odometercount                           | donut_odometercount_cb24373b                                    | customer_campaign_content_type_campaign_object_id_object_conten | {customer_id}                                 | {customer_id,campaign_content_type_id,campaign_object_id,object_content_type_id,object_object_id} | 91 MB          | 🟢 Can DROP: donut_odometercount_cb24373b
+ public      | donut_odometercount                           | donut_odometercount_fba3196d                                    | customer_campaign_content_type_campaign_object_id_object_conten | {object_content_type_id}                      | {customer_id,campaign_content_type_id,campaign_object_id,object_content_type_id,object_object_id} | 91 MB          | 🟢 Can DROP: donut_odometercount_fba3196d
+ public      | bureau_donation_form_additional_checkboxes    | bureau_donation_form_additional_checkboxes_donation_id          | bureau_donation_form_addition_donation_id_7a29e0d898bfcad2_uniq | {donation_id}                                 | {donation_id,campaignadditionalcheckbox_id}                                                       | 91 MB          | 🟢 Can DROP: bureau_donation_form_additional_checkboxes_donation_id
+ public      | reversion_version                             | reversion_version_417f1b1c                                      | reversion_v_content_f95daf_idx                                  | {content_type_id}                             | {content_type_id,db}                                                                              | 83 MB          | 🟢 Can DROP: reversion_version_417f1b1c
+ public      | reversion_version                             | reversion_version_417f1b1c                                      | reversion_version_db_46b2c1d7ad097ac4_uniq                      | {content_type_id}                             | {db,content_type_id,object_id,revision_id}                                                        | 83 MB          | 🟢 Can DROP: reversion_version_417f1b1c
+ public      | bureau_donation                               | bureau_donation_public_refid_ae343e2b                           | campaign_public_refid_unique                                    | {public_refid}                                | {campaign_id,public_refid}                                                                        | 77 MB          | 🟢 Can DROP: bureau_donation_public_refid_ae343e2b
+ public      | bureau_donation                               | bureau_donation_public_refid_ae343e2b_like                      | campaign_public_refid_unique                                    | {public_refid}                                | {campaign_id,public_refid}                                                                        | 77 MB          | 🟢 Can DROP: bureau_donation_public_refid_ae343e2b_like
+ public      | reversion_version                             | reversion_version_5de09a8d                                      | reversion_version_db_46b2c1d7ad097ac4_uniq                      | {revision_id}                                 | {db,content_type_id,object_id,revision_id}                                                        | 74 MB          | 🟢 Can DROP: reversion_version_5de09a8d
+ public      | bureau_sms                                    | bureau_sms_00eb2274                                             | bureau_sms_content_338f9d_idx                                   | {content_type_id}                             | {content_type_id,object_id}                                                                       | 54 MB          | 🟢 Can DROP: bureau_sms_00eb2274
+ public      | reversion_version                             | reversion_v_content_f95daf_idx                                  | reversion_version_db_46b2c1d7ad097ac4_uniq                      | {content_type_id,db}                          | {db,content_type_id,object_id,revision_id}                                                        | 43 MB          | 🟢 Can DROP: reversion_v_content_f95daf_idx
+ public      | nanny_fundraiserworkshift                     | nanny_fundraiserworkshift_fundraiser_id                         | fundraiser_date_unique                                          | {fundraiser_id}                               | {fundraiser_id,date}                                                                              | 43 MB          | 🟢 Can DROP: nanny_fundraiserworkshift_fundraiser_id
+(20 rows)
+
+-- 3.6 Missing indexes (tables with excessive seq scans)
+\echo '-- 3.6 Missing indexes (high seq scans on large tables)'
+-- 3.6 Missing indexes (high seq scans on large tables)
+SELECT 
+    schemaname,
+    relname AS table_name,
+    seq_scan,
+    seq_tup_read,
+    CASE WHEN seq_scan > 0 THEN seq_tup_read / seq_scan ELSE 0 END AS avg_rows_per_scan,
+    idx_scan,
+    ROUND(100.0 * idx_scan / NULLIF(seq_scan + idx_scan, 0), 2) AS idx_usage_pct,
+    n_live_tup AS rows,
+    pg_size_pretty(pg_total_relation_size(relid)) AS table_size
+FROM pg_stat_user_tables
+WHERE seq_scan > 50
+  AND n_live_tup > 10000
+  AND seq_tup_read / NULLIF(seq_scan, 0) > 1000
+  AND (idx_scan IS NULL OR idx_scan < seq_scan)
+ORDER BY seq_tup_read DESC
+LIMIT 20;
+ schemaname |         table_name         | seq_scan | seq_tup_read | avg_rows_per_scan | idx_scan | idx_usage_pct |  rows   | table_size 
+------------+----------------------------+----------+--------------+-------------------+----------+---------------+---------+------------
+ public     | api_webhook                |   103801 |  19509622045 |            187952 |    87682 |         45.79 |  190578 | 236 MB
+ public     | importer_importfileerror   |     4789 |   3673924159 |            767158 |     3308 |         40.85 | 2537705 | 347 MB
+ public     | donut_currencyexchangerate |      261 |     30139364 |            115476 |        0 |          0.00 |  116685 | 10168 kB
+(3 rows)
+
+-- 3.7 Index bloat candidates (large indexes with few scans)
+\echo '-- 3.7 Index bloat candidates (large but rarely used)'
+-- 3.7 Index bloat candidates (large but rarely used)
+SELECT 
+    schemaname,
+    relname AS table_name,
+    indexrelname AS index_name,
+    idx_scan,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    pg_size_pretty(pg_relation_size(relid)) AS table_size,
+    ROUND(100.0 * pg_relation_size(indexrelid) / NULLIF(pg_relation_size(relid), 0), 2) AS idx_to_table_pct,
+    'Consider REINDEX if bloated' AS note
+FROM pg_stat_user_indexes
+WHERE pg_relation_size(indexrelid) > 100 * 1024 * 1024
+  AND idx_scan < 1000
+ORDER BY pg_relation_size(indexrelid) DESC
+LIMIT 20;
+ schemaname |         table_name          |                      index_name                      | idx_scan | index_size | table_size | idx_to_table_pct |            note             
+------------+-----------------------------+------------------------------------------------------+----------+------------+------------+------------------+-----------------------------
+ public     | reversion_revision          | reversion_revision_c69e55a4                          |        8 | 699 MB     | 3149 MB    |            22.19 | Consider REINDEX if bloated
+ public     | tracking_event              | tracking_event_name_173b6385_like                    |        0 | 528 MB     | 3986 MB    |            13.25 | Consider REINDEX if bloated
+ public     | tracking_event              | tracking_event_name_173b6385                         |        0 | 528 MB     | 3986 MB    |            13.25 | Consider REINDEX if bloated
+ public     | tracking_event              | tracking_event_createtime_abc4b470                   |        0 | 240 MB     | 3986 MB    |             6.01 | Consider REINDEX if bloated
+ public     | bureau_recordexporthistory  | bureau_recordexporthistory_retrieval_status_98dde4c3 |      308 | 193 MB     | 9469 MB    |             2.04 | Consider REINDEX if bloated
+ public     | bureau_paymentattempt       | bureau_paymentattempt_cb24373b                       |       23 | 155 MB     | 618 MB     |            25.05 | Consider REINDEX if bloated
+ public     | actstream_action            | actstream_action_verb_83f768b7                       |        0 | 132 MB     | 271 MB     |            48.67 | Consider REINDEX if bloated
+ public     | actstream_action            | actstream_action_verb_83f768b7_like                  |        0 | 132 MB     | 271 MB     |            48.53 | Consider REINDEX if bloated
+ public     | bureau_paymentattempt       | bureau_paymentattempt_createtime_fb9d3495            |        0 | 131 MB     | 618 MB     |            21.15 | Consider REINDEX if bloated
+ public     | bureau_donation             | bureau_donation_hash_f7fc7b63_uniq                   |        0 | 127 MB     | 1976 MB    |             6.44 | Consider REINDEX if bloated
+ public     | oauth2_provider_accesstoken | oauth2_provider_accesstoken_id_token_id_key          |        0 | 104 MB     | 27 MB      |           385.46 | Consider REINDEX if bloated
+(11 rows)
+
+-- ============================================================================
+-- SECTION 4: Table Health & Maintenance
+-- ============================================================================
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 4: Table Health & Maintenance'
+SECTION 4: Table Health & Maintenance
+\echo '============================================================================'
+============================================================================
+-- 4.1 Tables overview
+\echo '-- 4.1 Tables overview'
+-- 4.1 Tables overview
+SELECT 
+    'Total Tables' AS metric,
+    count(*)::text AS value
+FROM pg_stat_user_tables
+UNION ALL
+SELECT 'Total Table Size', pg_size_pretty(sum(pg_total_relation_size(relid)))
+FROM pg_stat_user_tables
+UNION ALL
+SELECT 'Tables > 1GB', count(*)::text
+FROM pg_stat_user_tables WHERE pg_total_relation_size(relid) > 1024*1024*1024
+UNION ALL
+SELECT 'Tables needing VACUUM', count(*)::text
+FROM pg_stat_user_tables WHERE n_dead_tup > n_live_tup * 0.1 AND n_live_tup > 1000
+UNION ALL
+SELECT 'Tables never analyzed', count(*)::text
+FROM pg_stat_user_tables WHERE last_analyze IS NULL AND last_autoanalyze IS NULL;
+        metric         | value 
+-----------------------+-------
+ Total Tables          | 251
+ Total Table Size      | 54 GB
+ Tables > 1GB          | 12
+ Tables needing VACUUM | 1
+ Tables never analyzed | 0
+(5 rows)
+
+-- 4.2 Largest tables
+\echo '-- 4.2 Largest tables'
+-- 4.2 Largest tables
+SELECT 
+    schemaname,
+    relname AS table_name,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+    pg_size_pretty(pg_relation_size(relid)) AS table_size,
+    pg_size_pretty(pg_indexes_size(relid)) AS indexes_size,
+    pg_size_pretty(pg_total_relation_size(relid) - pg_relation_size(relid) - pg_indexes_size(relid)) AS toast_size,
+    n_live_tup AS rows,
+    CASE WHEN n_live_tup > 0 
+         THEN pg_relation_size(relid) / n_live_tup 
+         ELSE 0 END AS bytes_per_row
+FROM pg_stat_user_tables
+ORDER BY pg_total_relation_size(relid) DESC
+LIMIT 30;
+ schemaname |                  table_name                   | total_size | table_size | indexes_size | toast_size |   rows   | bytes_per_row 
+------------+-----------------------------------------------+------------+------------+--------------+------------+----------+---------------
+ public     | bureau_recordexporthistory                    | 11 GB      | 9469 MB    | 2216 MB      | 2760 kB    | 19432977 |           510
+ public     | tracking_event                                | 6160 MB    | 3986 MB    | 2173 MB      | 1160 kB    | 11183671 |           373
+ public     | reversion_version                             | 5791 MB    | 763 MB     | 639 MB       | 4390 MB    |  1345128 |           594
+ public     | reversion_revision                            | 5433 MB    | 3149 MB    | 2283 MB      | 928 kB     | 31597954 |           104
+ public     | bureau_donation                               | 4516 MB    | 1976 MB    | 1607 MB      | 932 MB     |  2588297 |           800
+ public     | donut_webrequest                              | 3280 MB    | 498 MB     | 590 MB       | 2192 MB    |   324802 |          1606
+ public     | nanny_team_locations                          | 1541 MB    | 339 MB     | 1202 MB      | 120 kB     |  7992471 |            44
+ public     | actstream_action                              | 1531 MB    | 271 MB     | 1259 MB      | 112 kB     |  2838593 |           100
+ public     | donut_rawrequest                              | 1375 MB    | 107 MB     | 29 MB        | 1238 MB    |   120272 |           935
+ public     | nanny_jobapplication                          | 1321 MB    | 71 MB      | 52 MB        | 1199 MB    |   263560 |           281
+ public     | bureau_paymentattempt                         | 1255 MB    | 618 MB     | 636 MB       | 208 kB     |  4866042 |           133
+ public     | bureau_donationadditionalsignature            | 1075 MB    | 11 MB      | 11 MB        | 1053 MB    |   158862 |            74
+ public     | bureau_recordimporthistory                    | 1016 MB    | 838 MB     | 177 MB       | 296 kB     |  1957104 |           449
+ public     | donut_odometercount                           | 937 MB     | 272 MB     | 665 MB       | 104 kB     |  3202113 |            89
+ public     | raisenow_epmswebhook                          | 699 MB     | 152 MB     | 293 MB       | 254 MB     |   600704 |           265
+ public     | bureau_sms                                    | 678 MB     | 432 MB     | 246 MB       | 152 kB     |  1787918 |           253
+ public     | bureau_donation_form_additional_radio_buttons | 627 MB     | 184 MB     | 443 MB       | 72 kB      |  4224928 |            45
+ public     | oauth2_provider_accesstoken                   | 594 MB     | 27 MB      | 566 MB       | 40 kB      |    13392 |          2115
+ public     | oauth2_provider_refreshtoken                  | 588 MB     | 127 MB     | 461 MB       | 64 kB      |    30649 |          4352
+ public     | bureau_donation_form_additional_checkboxes    | 557 MB     | 164 MB     | 393 MB       | 72 kB      |  3855552 |            44
+ public     | django_admin_log                              | 484 MB     | 215 MB     | 269 MB       | 144 kB     |  1126615 |           200
+ public     | django_session                                | 428 MB     | 2616 kB    | 425 MB       | 40 kB      |     6447 |           415
+ public     | nanny_fundraiserworkshift                     | 422 MB     | 129 MB     | 293 MB       | 64 kB      |  1538680 |            87
+ public     | bureau_campaign_translation                   | 376 MB     | 88 MB      | 6904 kB      | 281 MB     |     1644 |         56407
+ public     | importer_importfileerror                      | 347 MB     | 252 MB     | 94 MB        | 96 kB      |  2537705 |           104
+ public     | bureau_donationadditionaltextfield            | 320 MB     | 97 MB      | 223 MB       | 64 kB      |  2085356 |            48
+ public     | nanny_donationcampaignfundraiserworkshift     | 270 MB     | 112 MB     | 158 MB       | 56 kB      |  1626430 |            72
+ public     | api_webhook                                   | 236 MB     | 110 MB     | 37 MB        | 89 MB      |   190578 |           605
+ public     | bureau_unfinisheddonationadditionalsignature  | 229 MB     | 4552 kB    | 8600 kB      | 217 MB     |    62883 |            74
+ public     | thumbnail_kvstore                             | 222 MB     | 110 MB     | 112 MB       | 64 kB      |   537849 |           214
+(30 rows)
+
+-- 4.3 Tables with bloat (high dead tuple ratio)
+\echo '-- 4.3 Tables with bloat (high dead tuple ratio)'
+-- 4.3 Tables with bloat (high dead tuple ratio)
+SELECT 
+    schemaname,
+    relname AS table_name,
+    n_live_tup AS live_rows,
+    n_dead_tup AS dead_rows,
+    ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+    last_vacuum,
+    last_autovacuum,
+    CASE 
+        WHEN n_dead_tup > n_live_tup THEN '🔴 VACUUM FULL recommended'
+        WHEN n_dead_tup > n_live_tup * 0.5 THEN '🟠 VACUUM ANALYZE urgently'
+        WHEN n_dead_tup > n_live_tup * 0.2 THEN '🟡 VACUUM ANALYZE recommended'
+        ELSE '🟢 Monitor'
+    END AS recommendation
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 10000 OR n_dead_tup > n_live_tup * 0.1
+ORDER BY n_dead_tup DESC
+LIMIT 20;
+ schemaname |            table_name            | live_rows | dead_rows | dead_pct | total_size |          last_vacuum          |        last_autovacuum        |       recommendation       
+------------+----------------------------------+-----------+-----------+----------+------------+-------------------------------+-------------------------------+----------------------------
+ public     | nanny_team_locations             |   7992471 |     19624 |     0.24 | 1541 MB    | 2026-01-28 06:00:45.377957+00 | 2025-11-25 09:39:50.40859+00  | 🟢 Monitor
+ public     | bureau_campaign_translation      |      1644 |       174 |     9.57 | 376 MB     | 2026-01-28 06:00:04.528182+00 | 2025-12-18 06:00:13.108903+00 | 🟢 Monitor
+ public     | django_celery_beat_periodictasks |         1 |        18 |    94.74 | 168 kB     | 2026-01-28 06:00:18.830785+00 | 2026-01-28 11:42:42.736976+00 | 🔴 VACUUM FULL recommended
+ public     | axes_accessattempt               |        10 |         7 |    41.18 | 592 kB     | 2026-01-28 06:00:03.295055+00 | 2026-01-28 12:57:55.479656+00 | 🟠 VACUUM ANALYZE urgently
+(4 rows)
+
+-- 4.4 Tables approaching autovacuum threshold
+\echo '-- 4.4 Tables approaching autovacuum threshold'
+-- 4.4 Tables approaching autovacuum threshold
+SELECT 
+    schemaname,
+    relname AS table_name,
+    n_live_tup,
+    n_dead_tup,
+    -- Default autovacuum threshold: 50 + 0.2 * n_live_tup
+    50 + ROUND(0.2 * n_live_tup) AS vacuum_threshold,
+    ROUND(100.0 * n_dead_tup / NULLIF(50 + 0.2 * n_live_tup, 0), 2) AS pct_to_threshold,
+    last_autovacuum,
+    pg_size_pretty(pg_total_relation_size(relid)) AS size
+FROM pg_stat_user_tables
+WHERE n_dead_tup > (50 + 0.2 * n_live_tup) * 0.8
+  AND n_live_tup > 1000
+ORDER BY n_dead_tup DESC
+LIMIT 20;
+ schemaname | table_name | n_live_tup | n_dead_tup | vacuum_threshold | pct_to_threshold | last_autovacuum | size 
+------------+------------+------------+------------+------------------+------------------+-----------------+------
+(0 rows)
+
+-- 4.5 Tables never vacuumed/analyzed
+\echo '-- 4.5 Tables never vacuumed/analyzed (> 10 MB)'
+-- 4.5 Tables never vacuumed/analyzed (> 10 MB)
+SELECT 
+    schemaname,
+    relname AS table_name,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+    n_live_tup,
+    n_dead_tup,
+    n_tup_ins AS inserts,
+    n_tup_upd AS updates,
+    n_tup_del AS deletes,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze,
+    last_autoanalyze,
+    '🔴 Run ANALYZE' AS action
+FROM pg_stat_user_tables
+WHERE (last_vacuum IS NULL AND last_autovacuum IS NULL)
+   OR (last_analyze IS NULL AND last_autoanalyze IS NULL)
+ORDER BY pg_total_relation_size(relid) DESC
+LIMIT 20;
+ schemaname | table_name | total_size | n_live_tup | n_dead_tup | inserts | updates | deletes | last_vacuum | last_autovacuum | last_analyze | last_autoanalyze | action 
+------------+------------+------------+------------+------------+---------+---------+---------+-------------+-----------------+--------------+------------------+--------
+(0 rows)
+
+-- 4.6 Tables with stale statistics
+\echo '-- 4.6 Tables with stale statistics (analyze > 7 days ago)'
+-- 4.6 Tables with stale statistics (analyze > 7 days ago)
+SELECT 
+    schemaname,
+    relname AS table_name,
+    n_live_tup,
+    n_mod_since_analyze AS modifications_since_analyze,
+    ROUND(100.0 * n_mod_since_analyze / NULLIF(n_live_tup, 0), 2) AS mod_pct,
+    last_analyze,
+    last_autoanalyze,
+    GREATEST(last_analyze, last_autoanalyze) AS last_any_analyze,
+    pg_size_pretty(pg_total_relation_size(relid)) AS size
+FROM pg_stat_user_tables
+WHERE n_live_tup > 10000
+  AND (
+    (last_analyze IS NULL AND last_autoanalyze IS NULL)
+    OR GREATEST(last_analyze, last_autoanalyze) < now() - INTERVAL '7 days'
+    OR n_mod_since_analyze > n_live_tup * 0.1
+  )
+ORDER BY n_mod_since_analyze DESC
+LIMIT 20;
+ schemaname | table_name | n_live_tup | modifications_since_analyze | mod_pct | last_analyze | last_autoanalyze | last_any_analyze | size 
+------------+------------+------------+-----------------------------+---------+--------------+------------------+------------------+------
+(0 rows)
+
+-- 4.7 Tables with autovacuum disabled
+\echo '-- 4.7 Tables with autovacuum disabled'
+-- 4.7 Tables with autovacuum disabled
+SELECT 
+    n.nspname AS schema_name,
+    c.relname AS table_name,
+    pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
+    c.reloptions,
+    '🔴 Enable autovacuum!' AS action
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND c.relkind = 'r'
+  AND c.reloptions::text LIKE '%autovacuum_enabled=false%'
+ORDER BY pg_total_relation_size(c.oid) DESC;
+ schema_name | table_name | total_size | reloptions | action 
+-------------+------------+------------+------------+--------
+(0 rows)
+
+-- 4.8 Table I/O statistics
+\echo '-- 4.8 Table I/O statistics (reads from disk)'
+-- 4.8 Table I/O statistics (reads from disk)
+SELECT 
+    schemaname,
+    relname AS table_name,
+    heap_blks_read AS blocks_read,
+    heap_blks_hit AS blocks_hit,
+    ROUND(100.0 * heap_blks_hit / NULLIF(heap_blks_hit + heap_blks_read, 0), 2) AS cache_hit_pct,
+    pg_size_pretty((heap_blks_read * 8192)::bigint) AS data_from_disk,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size
+FROM pg_statio_user_tables
+WHERE heap_blks_read > 10000
+ORDER BY heap_blks_read DESC
+LIMIT 20;
+ schemaname |                  table_name                   | blocks_read | blocks_hit  | cache_hit_pct | data_from_disk | total_size 
+------------+-----------------------------------------------+-------------+-------------+---------------+----------------+------------
+ public     | bureau_recordexporthistory                    |   114431931 |  4736739657 |         97.64 | 873 GB         | 11 GB
+ public     | tracking_event                                |    54402358 |   178105508 |         76.60 | 415 GB         | 6160 MB
+ public     | reversion_revision                            |    51764111 |    14715770 |         22.14 | 395 GB         | 5433 MB
+ public     | bureau_recordimporthistory                    |    19961479 |   127460356 |         86.46 | 152 GB         | 1016 MB
+ public     | bureau_donation                               |    14882209 | 43419117321 |         99.97 | 114 GB         | 4516 MB
+ public     | bureau_paymentattempt                         |    13851766 |    67623823 |         83.00 | 106 GB         | 1255 MB
+ public     | reversion_version                             |    10920259 | 12906053338 |         99.92 | 83 GB          | 5791 MB
+ public     | bureau_sms                                    |     9294571 |   250528793 |         96.42 | 71 GB          | 678 MB
+ public     | donut_webrequest                              |     8255848 |  7032754910 |         99.88 | 63 GB          | 3280 MB
+ public     | actstream_action                              |     6943393 |   541428097 |         98.73 | 53 GB          | 1531 MB
+ public     | nanny_team_locations                          |     6350228 |   123040968 |         95.09 | 48 GB          | 1541 MB
+ public     | donut_odometercount                           |     5839555 |   816571808 |         99.29 | 45 GB          | 937 MB
+ public     | bureau_donation_form_additional_radio_buttons |     5367469 |    79377066 |         93.67 | 41 GB          | 627 MB
+ public     | importer_importfileerror                      |     5288823 |    48757329 |         90.21 | 40 GB          | 347 MB
+ public     | bureau_donation_form_additional_checkboxes    |     4746362 |    34778044 |         87.99 | 36 GB          | 557 MB
+ public     | donut_rawrequest                              |     3638856 |     2312131 |         38.85 | 28 GB          | 1375 MB
+ public     | oauth2_provider_refreshtoken                  |     3491629 |    27221768 |         88.63 | 27 GB          | 588 MB
+ public     | axes_accesslog                                |     2882218 |    16922409 |         85.45 | 22 GB          | 143 MB
+ public     | bureau_donationadditionaltextfield            |     2561719 |    22451034 |         89.76 | 20 GB          | 320 MB
+ public     | bureau_campaign_translation                   |     2507689 |     2677721 |         51.64 | 19 GB          | 376 MB
+(20 rows)
+
+-- 4.9 HOT updates ratio
+\echo '-- 4.9 HOT updates ratio (index efficiency)'
+-- 4.9 HOT updates ratio (index efficiency)
+SELECT 
+    schemaname,
+    relname AS table_name,
+    n_tup_upd AS updates,
+    n_tup_hot_upd AS hot_updates,
+    ROUND(100.0 * n_tup_hot_upd / NULLIF(n_tup_upd, 0), 2) AS hot_update_pct,
+    pg_size_pretty(pg_total_relation_size(relid)) AS size,
+    CASE 
+        WHEN n_tup_hot_upd::float / NULLIF(n_tup_upd, 0) < 0.5 
+        THEN '🟠 Low HOT ratio - check fillfactor'
+        ELSE '🟢 Good'
+    END AS status
+FROM pg_stat_user_tables
+WHERE n_tup_upd > 10000
+ORDER BY n_tup_upd DESC
+LIMIT 20;
+ schemaname |             table_name             | updates  | hot_updates | hot_update_pct |  size   |               status                
+------------+------------------------------------+----------+-------------+----------------+---------+-------------------------------------
+ public     | bureau_recordexporthistory         | 31054047 |    10254204 |          33.02 | 11 GB   | 🟠 Low HOT ratio - check fillfactor
+ public     | django_session                     |  8805658 |        1984 |           0.02 | 428 MB  | 🟠 Low HOT ratio - check fillfactor
+ public     | bureau_donation                    |  1390822 |      333586 |          23.98 | 4516 MB | 🟠 Low HOT ratio - check fillfactor
+ public     | raisenow_epmswebhook               |  1246248 |      379254 |          30.43 | 699 MB  | 🟠 Low HOT ratio - check fillfactor
+ public     | donut_webrequest                   |   437735 |           0 |           0.00 | 3280 MB | 🟠 Low HOT ratio - check fillfactor
+ public     | donut_user                         |   395608 |      340547 |          86.08 | 68 MB   | 🟢 Good
+ public     | django_celery_beat_periodictask    |   361412 |      336511 |          93.11 | 24 MB   | 🟢 Good
+ public     | bureau_donationformwording         |   287980 |      287455 |          99.82 | 312 kB  | 🟢 Good
+ public     | bureau_campaign                    |   287957 |      229194 |          79.59 | 2896 kB | 🟢 Good
+ public     | django_celery_beat_periodictasks   |   150650 |      149919 |          99.51 | 168 kB  | 🟢 Good
+ public     | bureau_donationadditionaltextfield |   121790 |       36595 |          30.05 | 320 MB  | 🟠 Low HOT ratio - check fillfactor
+ public     | bureau_unfinisheddonation          |   107716 |       18369 |          17.05 | 214 MB  | 🟠 Low HOT ratio - check fillfactor
+ public     | bureau_recordimporthistory         |    93563 |       65743 |          70.27 | 1016 MB | 🟢 Good
+ public     | nanny_fundraiser                   |    71015 |       42680 |          60.10 | 21 MB   | 🟢 Good
+ public     | oauth2_provider_accesstoken        |    68821 |           0 |           0.00 | 594 MB  | 🟠 Low HOT ratio - check fillfactor
+ public     | reversion_version                  |    54844 |           0 |           0.00 | 5791 MB | 🟠 Low HOT ratio - check fillfactor
+ public     | django_celery_beat_crontabschedule |    45651 |       45307 |          99.25 | 264 kB  | 🟢 Good
+ public     | nanny_fundraiserworkshift          |    38446 |       33118 |          86.14 | 422 MB  | 🟢 Good
+ public     | donut_odometercount                |    30628 |           0 |           0.00 | 937 MB  | 🟠 Low HOT ratio - check fillfactor
+ public     | oauth2_provider_refreshtoken       |    27388 |           0 |           0.00 | 588 MB  | 🟠 Low HOT ratio - check fillfactor
+(20 rows)
+
+-- ============================================================================
+-- SECTION 5: Connections, Sessions & Activity
+-- ============================================================================
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 5: Connections, Sessions & Activity'
+SECTION 5: Connections, Sessions & Activity
+\echo '============================================================================'
+============================================================================
+-- 5.1 Connections by state
+\echo '-- 5.1 Connections by state'
+-- 5.1 Connections by state
+SELECT 
+    state,
+    count(*) AS connections,
+    ROUND(100.0 * count(*) / SUM(count(*)) OVER (), 2) AS pct
+FROM pg_stat_activity
+WHERE datname = current_database()
+GROUP BY state
+ORDER BY connections DESC;
+ state  | connections |  pct  
+--------+-------------+-------
+ idle   |          11 | 91.67
+ active |           1 |  8.33
+(2 rows)
+
+-- 5.2 Connections by user
+\echo '-- 5.2 Connections by user'
+-- 5.2 Connections by user
+SELECT 
+    usename,
+    count(*) AS connections,
+    count(*) FILTER (WHERE state = 'active') AS active,
+    count(*) FILTER (WHERE state = 'idle') AS idle,
+    count(*) FILTER (WHERE state LIKE '%transaction%') AS in_transaction,
+    MAX(EXTRACT(EPOCH FROM (now() - backend_start)))::int AS oldest_conn_sec
+FROM pg_stat_activity
+WHERE datname = current_database()
+GROUP BY usename
+ORDER BY connections DESC;
+                     usename                      | connections | active | idle | in_transaction | oldest_conn_sec 
+--------------------------------------------------+-------------+--------+------+----------------+-----------------
+ rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |          11 |      0 |   11 |              0 |             593
+ radoslawboronski                                 |           1 |      1 |    0 |              0 |               4
+(2 rows)
+
+-- 5.3 Connections by application
+\echo '-- 5.3 Connections by application'
+-- 5.3 Connections by application
+SELECT 
+    COALESCE(application_name, 'unknown') AS application,
+    count(*) AS connections,
+    count(*) FILTER (WHERE state = 'active') AS active,
+    count(*) FILTER (WHERE state = 'idle') AS idle
+FROM pg_stat_activity
+WHERE datname = current_database()
+GROUP BY application_name
+ORDER BY connections DESC
+LIMIT 15;
+ application | connections | active | idle 
+-------------+-------------+--------+------
+             |          11 |      0 |   11
+ psql        |           1 |      1 |    0
+(2 rows)
+
+-- 5.4 Long running queries
+\echo '-- 5.4 Long running queries (> 1 min)'
+-- 5.4 Long running queries (> 1 min)
+SELECT 
+    pid,
+    usename,
+    application_name,
+    state,
+    EXTRACT(EPOCH FROM (now() - query_start))::int AS duration_sec,
+    wait_event_type,
+    wait_event,
+    LEFT(query, 100) AS query
+FROM pg_stat_activity
+WHERE state = 'active'
+  AND query_start < now() - INTERVAL '1 minute'
+  AND pid != pg_backend_pid()
+ORDER BY query_start;
+ pid | usename | application_name | state | duration_sec | wait_event_type | wait_event | query 
+-----+---------+------------------+-------+--------------+-----------------+------------+-------
+(0 rows)
+
+-- 5.5 Idle in transaction
+\echo '-- 5.5 Idle in transaction connections'
+-- 5.5 Idle in transaction connections
+SELECT 
+    pid,
+    usename,
+    application_name,
+    state,
+    EXTRACT(EPOCH FROM (now() - state_change))::int AS idle_in_txn_sec,
+    EXTRACT(EPOCH FROM (now() - xact_start))::int AS txn_duration_sec,
+    LEFT(query, 100) AS last_query
+FROM pg_stat_activity
+WHERE state LIKE '%transaction%'
+ORDER BY xact_start;
+ pid | usename | application_name | state | idle_in_txn_sec | txn_duration_sec | last_query 
+-----+---------+------------------+-------+-----------------+------------------+------------
+(0 rows)
+
+-- 5.6 Oldest connections
+\echo '-- 5.6 Oldest connections'
+-- 5.6 Oldest connections
+SELECT 
+    pid,
+    usename,
+    application_name,
+    client_addr,
+    backend_start,
+    EXTRACT(EPOCH FROM (now() - backend_start))::int / 3600 AS conn_hours,
+    state
+FROM pg_stat_activity
+WHERE datname = current_database()
+ORDER BY backend_start
+LIMIT 15;
+  pid  |                     usename                      | application_name | client_addr |         backend_start         | conn_hours | state  
+-------+--------------------------------------------------+------------------+-------------+-------------------------------+------------+--------
+ 11192 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.118 | 2026-01-28 13:28:01.723983+00 |          0 | idle
+ 11401 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.176 | 2026-01-28 13:29:41.771947+00 |          0 | idle
+ 11650 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.105 | 2026-01-28 13:31:17.066422+00 |          0 | idle
+ 11848 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.179 | 2026-01-28 13:32:30.37814+00  |          0 | idle
+ 11970 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.56  | 2026-01-28 13:33:10.869797+00 |          0 | idle
+ 12005 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.176 | 2026-01-28 13:33:24.974854+00 |          0 | idle
+ 12268 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.116 | 2026-01-28 13:35:37.165145+00 |          0 | idle
+ 12307 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.179 | 2026-01-28 13:35:55.628948+00 |          0 | idle
+ 12312 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.118 | 2026-01-28 13:35:59.78565+00  |          0 | idle
+ 12410 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.116 | 2026-01-28 13:36:35.883764+00 |          0 | idle
+ 12684 | rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt |                  | 10.10.0.105 | 2026-01-28 13:37:43.874544+00 |          0 | idle
+ 12712 | radoslawboronski                                 | psql             | 10.10.0.78  | 2026-01-28 13:37:50.579855+00 |          0 | active
+(12 rows)
+
+-- 5.7 Wait events summary
+\echo '-- 5.7 Wait events summary'
+-- 5.7 Wait events summary
+SELECT 
+    wait_event_type,
+    wait_event,
+    count(*) AS sessions
+FROM pg_stat_activity
+WHERE wait_event IS NOT NULL
+  AND datname = current_database()
+GROUP BY wait_event_type, wait_event
+ORDER BY sessions DESC
+LIMIT 15;
+ wait_event_type | wait_event | sessions 
+-----------------+------------+----------
+ Client          | ClientRead |       11
+(1 row)
+
+-- ============================================================================
+-- SECTION 6: Locks & Blocking
+-- ============================================================================
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 6: Locks & Blocking'
+SECTION 6: Locks & Blocking
+\echo '============================================================================'
+============================================================================
+-- 6.1 Lock types summary
+\echo '-- 6.1 Lock types summary'
+-- 6.1 Lock types summary
+SELECT 
+    locktype,
+    mode,
+    count(*) AS locks,
+    count(*) FILTER (WHERE granted) AS granted,
+    count(*) FILTER (WHERE NOT granted) AS waiting
+FROM pg_locks
+GROUP BY locktype, mode
+ORDER BY locks DESC;
+  locktype  |      mode       | locks | granted | waiting 
+------------+-----------------+-------+---------+---------
+ relation   | AccessShareLock |     1 |       1 |       0
+ virtualxid | ExclusiveLock   |     1 |       1 |       0
+(2 rows)
+
+-- 6.2 Current blocking chains
+\echo '-- 6.2 Current blocking chains'
+-- 6.2 Current blocking chains
+SELECT 
+    blocked.pid AS blocked_pid,
+    blocked.usename AS blocked_user,
+    blocked.application_name AS blocked_app,
+    blocking.pid AS blocking_pid,
+    blocking.usename AS blocking_user,
+    blocking.application_name AS blocking_app,
+    EXTRACT(EPOCH FROM (now() - blocked.query_start))::int AS blocked_duration_sec,
+    blocked_locks.locktype,
+    blocked_locks.mode AS blocked_mode,
+    LEFT(blocked.query, 60) AS blocked_query,
+    LEFT(blocking.query, 60) AS blocking_query
+FROM pg_stat_activity blocked
+JOIN pg_locks blocked_locks ON blocked.pid = blocked_locks.pid AND NOT blocked_locks.granted
+JOIN pg_locks blocking_locks ON blocked_locks.locktype = blocking_locks.locktype
+    AND blocked_locks.database IS NOT DISTINCT FROM blocking_locks.database
+    AND blocked_locks.relation IS NOT DISTINCT FROM blocking_locks.relation
+    AND blocked_locks.page IS NOT DISTINCT FROM blocking_locks.page
+    AND blocked_locks.tuple IS NOT DISTINCT FROM blocking_locks.tuple
+    AND blocked_locks.virtualxid IS NOT DISTINCT FROM blocking_locks.virtualxid
+    AND blocked_locks.transactionid IS NOT DISTINCT FROM blocking_locks.transactionid
+    AND blocked_locks.classid IS NOT DISTINCT FROM blocking_locks.classid
+    AND blocked_locks.objid IS NOT DISTINCT FROM blocking_locks.objid
+    AND blocked_locks.objsubid IS NOT DISTINCT FROM blocking_locks.objsubid
+    AND blocked_locks.pid != blocking_locks.pid
+    AND blocking_locks.granted
+JOIN pg_stat_activity blocking ON blocking_locks.pid = blocking.pid
+ORDER BY blocked.query_start;
+ blocked_pid | blocked_user | blocked_app | blocking_pid | blocking_user | blocking_app | blocked_duration_sec | locktype | blocked_mode | blocked_query | blocking_query 
+-------------+--------------+-------------+--------------+---------------+--------------+----------------------+----------+--------------+---------------+----------------
+(0 rows)
+
+-- 6.3 Tables with most locks
+\echo '-- 6.3 Tables with most locks'
+-- 6.3 Tables with most locks
+SELECT 
+    c.relname AS table_name,
+    l.locktype,
+    l.mode,
+    count(*) AS lock_count,
+    count(*) FILTER (WHERE NOT l.granted) AS waiting
+FROM pg_locks l
+JOIN pg_class c ON l.relation = c.oid
+WHERE c.relkind = 'r'
+GROUP BY c.relname, l.locktype, l.mode
+HAVING count(*) > 1
+ORDER BY lock_count DESC
+LIMIT 20;
+ table_name | locktype | mode | lock_count | waiting 
+------------+----------+------+------------+---------
+(0 rows)
+
+-- ============================================================================
+-- SECTION 7: Replication & WAL
+-- ============================================================================
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 7: Replication & WAL'
+SECTION 7: Replication & WAL
+\echo '============================================================================'
+============================================================================
+-- 7.1 Replication slots
+\echo '-- 7.1 Replication slots'
+-- 7.1 Replication slots
+SELECT 
+    slot_name,
+    slot_type,
+    database,
+    active,
+    xmin,
+    catalog_xmin,
+    restart_lsn,
+    confirmed_flush_lsn,
+    pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS lag_size,
+    CASE 
+        WHEN NOT active THEN '🔴 INACTIVE - may block WAL recycling'
+        WHEN pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) > 1073741824 THEN '🟠 Large lag (>1GB)'
+        ELSE '🟢 OK'
+    END AS status
+FROM pg_replication_slots;
+ slot_name | slot_type | database | active | xmin | catalog_xmin | restart_lsn | confirmed_flush_lsn | lag_size | status 
+-----------+-----------+----------+--------+------+--------------+-------------+---------------------+----------+--------
+(0 rows)
+
+-- 7.2 Replication status
+\echo '-- 7.2 Replication status'
+-- 7.2 Replication status
+SELECT 
+    client_addr,
+    usename,
+    application_name,
+    state,
+    sync_state,
+    pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) AS replay_lag,
+    pg_size_pretty(pg_wal_lsn_diff(sent_lsn, flush_lsn)) AS flush_lag,
+    pg_size_pretty(pg_wal_lsn_diff(sent_lsn, write_lsn)) AS write_lag
+FROM pg_stat_replication;
+ client_addr | usename | application_name | state | sync_state | replay_lag | flush_lag | write_lag 
+-------------+---------+------------------+-------+------------+------------+-----------+-----------
+(0 rows)
+
+-- 7.3 WAL statistics
+\echo '-- 7.3 WAL statistics'
+-- 7.3 WAL statistics
+SELECT 
+    pg_current_wal_lsn() AS current_wal_lsn;
+psql:pg_comprehensive_health_check.sql:795: ERROR:  wal_level must be set to 'logical'
+HINT:  WAL control functions cannot be executed when wal_level < logical.
+-- 7.4 Archive status
+\echo '-- 7.4 Archive status'
+-- 7.4 Archive status
+SELECT 
+    archived_count,
+    last_archived_wal,
+    last_archived_time,
+    failed_count,
+    last_failed_wal,
+    last_failed_time,
+    CASE 
+        WHEN failed_count > 0 THEN '🔴 Archive failures detected'
+        ELSE '🟢 OK'
+    END AS status
+FROM pg_stat_archiver;
+ archived_count | last_archived_wal | last_archived_time | failed_count | last_failed_wal | last_failed_time | status 
+----------------+-------------------+--------------------+--------------+-----------------+------------------+--------
+              0 |                   |                    |            0 |                 |                  | 🟢 OK
+(1 row)
+
+-- ============================================================================
+-- SECTION 8: Background Processes
+-- ============================================================================
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 8: Background Processes'
+SECTION 8: Background Processes
+\echo '============================================================================'
+============================================================================
+-- 8.1 Background writer stats
+\echo '-- 8.1 Background writer stats'
+-- 8.1 Background writer stats
+SELECT 
+    checkpoints_timed,
+    checkpoints_req,
+    ROUND(100.0 * checkpoints_req / NULLIF(checkpoints_timed + checkpoints_req, 0), 2) AS pct_requested,
+    checkpoint_write_time / 1000 AS checkpoint_write_sec,
+    checkpoint_sync_time / 1000 AS checkpoint_sync_sec,
+    buffers_checkpoint,
+    buffers_clean,
+    maxwritten_clean,
+    buffers_backend,
+    buffers_backend_fsync,
+    buffers_alloc,
+    stats_reset,
+    CASE 
+        WHEN checkpoints_req::float / NULLIF(checkpoints_timed + checkpoints_req, 0) > 0.5 
+        THEN '🟠 Too many forced checkpoints - increase checkpoint_segments'
+        ELSE '🟢 OK'
+    END AS status
+FROM pg_stat_bgwriter;
+ checkpoints_timed | checkpoints_req | pct_requested | checkpoint_write_sec | checkpoint_sync_sec | buffers_checkpoint | buffers_clean | maxwritten_clean | buffers_backend | buffers_backend_fsync | buffers_alloc |          stats_reset          | status 
+-------------------+-----------------+---------------+----------------------+---------------------+--------------------+---------------+------------------+-----------------+-----------------------+---------------+-------------------------------+--------
+            160867 |               1 |          0.00 |              160.868 |             160.861 |                  0 |             0 |                0 |               0 |                     0 |             0 | 2025-10-08 17:04:56.228126+00 | 🟢 OK
+(1 row)
+
+-- 8.2 Autovacuum workers
+\echo '-- 8.2 Current autovacuum workers'
+-- 8.2 Current autovacuum workers
+SELECT 
+    pid,
+    datname,
+    usename,
+    EXTRACT(EPOCH FROM (now() - query_start))::int AS duration_sec,
+    state,
+    LEFT(query, 100) AS query
+FROM pg_stat_activity
+WHERE query LIKE 'autovacuum:%'
+ORDER BY query_start;
+ pid | datname | usename | duration_sec | state | query 
+-----+---------+---------+--------------+-------+-------
+(0 rows)
+
+-- 8.3 Vacuum progress
+\echo '-- 8.3 Vacuum progress'
+-- 8.3 Vacuum progress
+SELECT 
+    pid,
+    datname,
+    relid::regclass AS table_name,
+    phase,
+    heap_blks_total,
+    heap_blks_scanned,
+    ROUND(100.0 * heap_blks_scanned / NULLIF(heap_blks_total, 0), 2) AS scan_pct,
+    heap_blks_vacuumed,
+    index_vacuum_count,
+    max_dead_tuples,
+    num_dead_tuples
+FROM pg_stat_progress_vacuum;
+ pid | datname | table_name | phase | heap_blks_total | heap_blks_scanned | scan_pct | heap_blks_vacuumed | index_vacuum_count | max_dead_tuples | num_dead_tuples 
+-----+---------+------------+-------+-----------------+-------------------+----------+--------------------+--------------------+-----------------+-----------------
+(0 rows)
+
+-- ============================================================================
+-- SECTION 9: Configuration Analysis
+-- ============================================================================
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 9: Configuration Analysis'
+SECTION 9: Configuration Analysis
+\echo '============================================================================'
+============================================================================
+-- 9.1 Memory settings
+\echo '-- 9.1 Memory settings'
+-- 9.1 Memory settings
+SELECT 
+    name,
+    setting,
+    unit,
+    CASE name
+        WHEN 'shared_buffers' THEN 'Target: ~25% of RAM. Current: ' || pg_size_pretty(setting::bigint * 
+            CASE unit WHEN '8kB' THEN 8192 WHEN 'kB' THEN 1024 WHEN 'MB' THEN 1048576 ELSE 1 END)
+        WHEN 'effective_cache_size' THEN 'Target: ~75% of RAM. Current: ' || pg_size_pretty(setting::bigint * 
+            CASE unit WHEN '8kB' THEN 8192 WHEN 'kB' THEN 1024 WHEN 'MB' THEN 1048576 ELSE 1 END)
+        WHEN 'work_mem' THEN 'Per-sort/hash. Be careful with high values + many connections'
+        WHEN 'maintenance_work_mem' THEN 'For VACUUM, CREATE INDEX. Can be higher.'
+        WHEN 'wal_buffers' THEN 'Usually auto-tuned. -1 = auto'
+        ELSE ''
+    END AS recommendation
+FROM pg_settings
+WHERE name IN ('shared_buffers', 'effective_cache_size', 'work_mem', 
+               'maintenance_work_mem', 'wal_buffers', 'huge_pages')
+ORDER BY name;
+         name         | setting | unit |                        recommendation                         
+----------------------+---------+------+---------------------------------------------------------------
+ effective_cache_size | 2687582 | 8kB  | Target: ~75% of RAM. Current: 21 GB
+ huge_pages           | on      |      | 
+ maintenance_work_mem | 527360  | kB   | For VACUUM, CREATE INDEX. Can be higher.
+ shared_buffers       | 2687582 | 8kB  | Target: ~25% of RAM. Current: 21 GB
+ wal_buffers          | -1      | 8kB  | Usually auto-tuned. -1 = auto
+ work_mem             | 8192    | kB   | Per-sort/hash. Be careful with high values + many connections
+(6 rows)
+
+-- 9.2 Connection settings
+\echo '-- 9.2 Connection settings'
+-- 9.2 Connection settings
+SELECT 
+    name,
+    setting,
+    unit,
+    CASE name
+        WHEN 'max_connections' THEN 'Current connections: ' || (SELECT count(*) FROM pg_stat_activity)::text
+        WHEN 'superuser_reserved_connections' THEN 'Reserved for superusers'
+        ELSE ''
+    END AS note
+FROM pg_settings
+WHERE name IN ('max_connections', 'superuser_reserved_connections', 
+               'tcp_keepalives_idle', 'tcp_keepalives_interval', 'tcp_keepalives_count')
+ORDER BY name;
+              name              | setting | unit |          note           
+--------------------------------+---------+------+-------------------------
+ max_connections                | 3457    |      | Current connections: 24
+ superuser_reserved_connections | 3       |      | Reserved for superusers
+ tcp_keepalives_count           | 2       |      | 
+ tcp_keepalives_idle            | 300     | s    | 
+ tcp_keepalives_interval        | 30      | s    | 
+(5 rows)
+
+-- 9.3 Checkpoint & WAL settings
+\echo '-- 9.3 Checkpoint & WAL settings'
+-- 9.3 Checkpoint & WAL settings
+SELECT 
+    name,
+    setting,
+    unit,
+    CASE name
+        WHEN 'checkpoint_completion_target' THEN 'Target: 0.9'
+        WHEN 'checkpoint_timeout' THEN 'Default: 5min. Consider 15-30min for write-heavy'
+        WHEN 'max_wal_size' THEN 'Increase if frequent checkpoints'
+        ELSE ''
+    END AS recommendation
+FROM pg_settings
+WHERE name IN ('checkpoint_completion_target', 'checkpoint_timeout', 
+               'max_wal_size', 'min_wal_size', 'wal_level', 'archive_mode')
+ORDER BY name;
+             name             | setting | unit |                  recommendation                  
+------------------------------+---------+------+--------------------------------------------------
+ archive_mode                 | off     |      | 
+ checkpoint_completion_target | 0.9     |      | Target: 0.9
+ checkpoint_timeout           | 60      | s    | Default: 5min. Consider 15-30min for write-heavy
+ max_wal_size                 | 1024    | MB   | Increase if frequent checkpoints
+ min_wal_size                 | 512     | MB   | 
+ wal_level                    | replica |      | 
+(6 rows)
+
+-- 9.4 Autovacuum settings
+\echo '-- 9.4 Autovacuum settings'
+-- 9.4 Autovacuum settings
+SELECT 
+    name,
+    setting,
+    unit,
+    CASE name
+        WHEN 'autovacuum' THEN CASE setting WHEN 'on' THEN '🟢 Enabled' ELSE '🔴 DISABLED!' END
+        WHEN 'autovacuum_max_workers' THEN 'Consider increasing for many tables'
+        WHEN 'autovacuum_vacuum_scale_factor' THEN 'Default 0.2 = vacuum when 20% dead rows'
+        WHEN 'autovacuum_analyze_scale_factor' THEN 'Default 0.1 = analyze when 10% changed'
+        ELSE ''
+    END AS note
+FROM pg_settings
+WHERE name LIKE 'autovacuum%'
+ORDER BY name;
+                 name                  |  setting  | unit |                  note                   
+---------------------------------------+-----------+------+-----------------------------------------
+ autovacuum                            | on        |      | 🟢 Enabled
+ autovacuum_analyze_scale_factor       | 0.05      |      | Default 0.1 = analyze when 10% changed
+ autovacuum_analyze_threshold          | 50        |      | 
+ autovacuum_freeze_max_age             | 200000000 |      | 
+ autovacuum_max_workers                | 3         |      | Consider increasing for many tables
+ autovacuum_multixact_freeze_max_age   | 400000000 |      | 
+ autovacuum_naptime                    | 5         | s    | 
+ autovacuum_vacuum_cost_delay          | 5         | ms   | 
+ autovacuum_vacuum_cost_limit          | 600       |      | 
+ autovacuum_vacuum_insert_scale_factor | 0.2       |      | 
+ autovacuum_vacuum_insert_threshold    | 1000      |      | 
+ autovacuum_vacuum_scale_factor        | 0.1       |      | Default 0.2 = vacuum when 20% dead rows
+ autovacuum_vacuum_threshold           | 50        |      | 
+ autovacuum_work_mem                   | 1005708   | kB   | 
+(14 rows)
+
+-- 9.5 Query planner settings
+\echo '-- 9.5 Query planner settings'
+-- 9.5 Query planner settings
+SELECT 
+    name,
+    setting,
+    unit,
+    CASE name
+        WHEN 'random_page_cost' THEN 'For SSD: use 1.1-1.5. Current may be too high for SSD.'
+        WHEN 'effective_io_concurrency' THEN 'For SSD: use 200'
+        WHEN 'seq_page_cost' THEN 'Usually keep at 1.0'
+        ELSE ''
+    END AS recommendation
+FROM pg_settings
+WHERE name IN ('random_page_cost', 'seq_page_cost', 'effective_io_concurrency',
+               'cpu_tuple_cost', 'cpu_index_tuple_cost', 'cpu_operator_cost',
+               'parallel_tuple_cost', 'parallel_setup_cost')
+ORDER BY name;
+           name           | setting | unit |                     recommendation                     
+--------------------------+---------+------+--------------------------------------------------------
+ cpu_index_tuple_cost     | 0.005   |      | 
+ cpu_operator_cost        | 0.0025  |      | 
+ cpu_tuple_cost           | 0.01    |      | 
+ effective_io_concurrency | 1       |      | For SSD: use 200
+ parallel_setup_cost      | 1000    |      | 
+ parallel_tuple_cost      | 0.1     |      | 
+ random_page_cost         | 4       |      | For SSD: use 1.1-1.5. Current may be too high for SSD.
+ seq_page_cost            | 1       |      | Usually keep at 1.0
+(8 rows)
+
+-- 9.6 Parallelism settings
+\echo '-- 9.6 Parallelism settings'
+-- 9.6 Parallelism settings
+SELECT 
+    name,
+    setting,
+    unit
+FROM pg_settings
+WHERE name IN ('max_worker_processes', 'max_parallel_workers', 
+               'max_parallel_workers_per_gather', 'max_parallel_maintenance_workers',
+               'parallel_leader_participation', 'min_parallel_table_scan_size',
+               'min_parallel_index_scan_size')
+ORDER BY name;
+               name               | setting | unit 
+----------------------------------+---------+------
+ max_parallel_maintenance_workers | 2       | 
+ max_parallel_workers             | 8       | 
+ max_parallel_workers_per_gather  | 2       | 
+ max_worker_processes             | 8       | 
+ min_parallel_index_scan_size     | 64      | 8kB
+ min_parallel_table_scan_size     | 1024    | 8kB
+ parallel_leader_participation    | on      | 
+(7 rows)
+
+-- 9.7 Logging settings
+\echo '-- 9.7 Logging settings'
+-- 9.7 Logging settings
+SELECT 
+    name,
+    setting,
+    unit
+FROM pg_settings
+WHERE name IN ('log_min_duration_statement', 'log_statement', 'log_lock_waits',
+               'log_temp_files', 'log_checkpoints', 'log_connections',
+               'log_disconnections', 'log_autovacuum_min_duration')
+ORDER BY name;
+            name             | setting | unit 
+-----------------------------+---------+------
+ log_autovacuum_min_duration | 10000   | ms
+ log_checkpoints             | off     | 
+ log_connections             | on      | 
+ log_disconnections          | on      | 
+ log_lock_waits              | off     | 
+ log_min_duration_statement  | 1000    | ms
+ log_statement               | ddl     | 
+ log_temp_files              | -1      | kB
+(8 rows)
+
+-- ============================================================================
+-- SECTION 10: Extensions
+-- ============================================================================
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 10: Installed Extensions'
+SECTION 10: Installed Extensions
+\echo '============================================================================'
+============================================================================
+\echo '-- 10.1 Installed extensions'
+-- 10.1 Installed extensions
+SELECT 
+    extname AS extension,
+    extversion AS version,
+    n.nspname AS schema
+FROM pg_extension e
+JOIN pg_namespace n ON e.extnamespace = n.oid
+ORDER BY extname;
+     extension      | version |   schema   
+--------------------+---------+------------
+ pg_stat_statements | 1.4     | public
+ pg_trgm            | 1.6     | public
+ pgcrypto           | 1.3     | public
+ plpgsql            | 1.0     | pg_catalog
+ postgis            | 3.4.0   | public
+ postgis_raster     | 3.4.0   | public
+(6 rows)
+
+-- ============================================================================
+-- SECTION 11: Security Overview
+-- ============================================================================
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'SECTION 11: Security Overview'
+SECTION 11: Security Overview
+\echo '============================================================================'
+============================================================================
+-- 11.1 Superusers
+\echo '-- 11.1 Superusers'
+-- 11.1 Superusers
+SELECT 
+    rolname,
+    rolsuper,
+    rolinherit,
+    rolcreaterole,
+    rolcreatedb,
+    rolcanlogin,
+    rolreplication,
+    rolbypassrls
+FROM pg_roles
+WHERE rolsuper = true
+ORDER BY rolname;
+ rolname  | rolsuper | rolinherit | rolcreaterole | rolcreatedb | rolcanlogin | rolreplication | rolbypassrls 
+----------+----------+------------+---------------+-------------+-------------+----------------+--------------
+ rdsadmin | t        | t          | t             | t           | t           | t              | t
+(1 row)
+
+-- 11.2 Users with login
+\echo '-- 11.2 Users with login capability'
+-- 11.2 Users with login capability
+SELECT 
+    rolname,
+    rolsuper,
+    rolcreatedb,
+    rolcreaterole,
+    rolreplication,
+    rolconnlimit,
+    rolvaliduntil
+FROM pg_roles
+WHERE rolcanlogin = true
+ORDER BY rolname;
+                     rolname                      | rolsuper | rolcreatedb | rolcreaterole | rolreplication | rolconnlimit | rolvaliduntil 
+--------------------------------------------------+----------+-------------+---------------+----------------+--------------+---------------
+ dbt_core_reader                                  | f        | f           | f             | f              |           -1 | 
+ pganalyze                                        | f        | f           | f             | f              |            5 | 
+ rUwrGvbinkSw3vpEr5r6TylOxMoWojM98kOS9n53kEUXXatt | f        | t           | t             | f              |           -1 | infinity
+ radoslawboronski                                 | f        | f           | f             | f              |           -1 | 
+ rdsadmin                                         | t        | t           | t             | t              |           -1 | infinity
+ rdswriteforwarduser                              | f        | f           | f             | f              |           -1 | 
+(6 rows)
+
+-- 11.3 Tables with RLS disabled
+\echo '-- 11.3 Row Level Security status'
+-- 11.3 Row Level Security status
+SELECT 
+    schemaname,
+    tablename,
+    rowsecurity
+FROM pg_tables
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY schemaname, tablename
+LIMIT 20;
+ schemaname |                 tablename                  | rowsecurity 
+------------+--------------------------------------------+-------------
+ public     | actstream_action                           | f
+ public     | actstream_follow                           | f
+ public     | api_webhook                                | f
+ public     | api_webhookcondition                       | f
+ public     | api_webhookconditiongroup                  | f
+ public     | api_webhookconfiguration                   | f
+ public     | auth_group                                 | f
+ public     | auth_group_permissions                     | f
+ public     | auth_permission                            | f
+ public     | axes_accessattempt                         | f
+ public     | axes_accessattemptexpiration               | f
+ public     | axes_accessfailurelog                      | f
+ public     | axes_accesslog                             | f
+ public     | bureau_academictitleconfig                 | f
+ public     | bureau_academictitleconfig_translation     | f
+ public     | bureau_campaign                            | f
+ public     | bureau_campaign_accepted_donor_countries   | f
+ public     | bureau_campaign_accepted_payment_countries | f
+ public     | bureau_campaign_callcenter_api_users       | f
+ public     | bureau_campaign_campaign_manager           | f
+(20 rows)
+
+-- ============================================================================
+-- SECTION 12: Health Check Summary
+-- ============================================================================
+\echo ''
+
+\echo '╔══════════════════════════════════════════════════════════════════════════╗'
+╔══════════════════════════════════════════════════════════════════════════╗
+\echo '║                         HEALTH CHECK SUMMARY                              ║'
+║                         HEALTH CHECK SUMMARY                              ║
+\echo '╚══════════════════════════════════════════════════════════════════════════╝'
+╚══════════════════════════════════════════════════════════════════════════╝
+\echo ''
+
+SELECT '📊 Database' AS category, 'Size' AS metric, pg_size_pretty(pg_database_size(current_database())) AS value
+UNION ALL SELECT '📊 Database', 'Tables', (SELECT count(*)::text FROM pg_stat_user_tables)
+UNION ALL SELECT '📊 Database', 'Indexes', (SELECT count(*)::text FROM pg_stat_user_indexes)
+UNION ALL SELECT '📊 Database', 'Uptime', (SELECT EXTRACT(EPOCH FROM (now() - pg_postmaster_start_time()))::int / 86400 || ' days')
+UNION ALL SELECT '🔗 Connections', 'Total', (SELECT count(*)::text FROM pg_stat_activity WHERE datname = current_database())
+UNION ALL SELECT '🔗 Connections', 'Active', (SELECT count(*)::text FROM pg_stat_activity WHERE state = 'active' AND pid != pg_backend_pid())
+UNION ALL SELECT '🔗 Connections', 'Idle in Transaction', (SELECT count(*)::text FROM pg_stat_activity WHERE state LIKE '%transaction%')
+UNION ALL SELECT '🔗 Connections', 'Long Running (>5min)', (SELECT count(*)::text FROM pg_stat_activity WHERE state = 'active' AND query_start < now() - INTERVAL '5 minutes')
+UNION ALL SELECT '🔒 Locks', 'Blocked Sessions', (SELECT count(*)::text FROM pg_locks WHERE NOT granted)
+UNION ALL SELECT '💾 Cache', 'Table Hit Ratio', (SELECT ROUND(100.0 * sum(heap_blks_hit) / nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0), 2)::text || '%' FROM pg_statio_user_tables)
+UNION ALL SELECT '💾 Cache', 'Index Hit Ratio', (SELECT ROUND(100.0 * sum(idx_blks_hit) / nullif(sum(idx_blks_hit) + sum(idx_blks_read), 0), 2)::text || '%' FROM pg_statio_user_indexes)
+UNION ALL SELECT '🧹 Maintenance', 'Tables Needing VACUUM', (SELECT count(*)::text FROM pg_stat_user_tables WHERE n_dead_tup > n_live_tup * 0.1 AND n_live_tup > 1000)
+UNION ALL SELECT '🧹 Maintenance', 'Tables Never Analyzed', (SELECT count(*)::text FROM pg_stat_user_tables WHERE last_analyze IS NULL AND last_autoanalyze IS NULL AND n_live_tup > 1000)
+UNION ALL SELECT '📇 Indexes', 'Unused (>1MB)', (SELECT count(*)::text FROM pg_stat_user_indexes ui JOIN pg_index i ON ui.indexrelid = i.indexrelid WHERE idx_scan = 0 AND pg_relation_size(ui.indexrelid) > 1024*1024 AND NOT i.indisprimary AND NOT i.indisunique)
+UNION ALL SELECT '📇 Indexes', 'Zero Efficiency', (SELECT count(*)::text FROM pg_stat_user_indexes WHERE idx_tup_read > 10000 AND idx_tup_fetch = 0)
+UNION ALL SELECT '⚠️ XID Age', 'Status', (SELECT CASE WHEN age(datfrozenxid) > 1500000000 THEN '🔴 CRITICAL' WHEN age(datfrozenxid) > 1000000000 THEN '🟠 WARNING' ELSE '🟢 OK (' || age(datfrozenxid)::text || ')' END FROM pg_database WHERE datname = current_database());
+    category    |        metric         |     value      
+----------------+-----------------------+----------------
+ 📊 Database    | Size                  | 54 GB
+ 📊 Database    | Tables                | 251
+ 📊 Database    | Indexes               | 1254
+ 📊 Database    | Uptime                | 111 days
+ 🔗 Connections | Total                 | 12
+ 🔗 Connections | Active                | 0
+ 🔗 Connections | Idle in Transaction   | 0
+ 🔗 Connections | Long Running (>5min)  | 0
+ 🔒 Locks       | Blocked Sessions      | 0
+ 💾 Cache       | Table Hit Ratio       | 99.67%
+ 💾 Cache       | Index Hit Ratio       | 99.77%
+ 🧹 Maintenance | Tables Needing VACUUM | 1
+ 🧹 Maintenance | Tables Never Analyzed | 0
+ 📇 Indexes     | Unused (>1MB)         | 56
+ 📇 Indexes     | Zero Efficiency       | 32
+ ⚠️ XID Age      | Status                | 🟢 OK (144193)
+(16 rows)
+
+\echo ''
+
+\echo '============================================================================'
+============================================================================
+\echo 'ISSUE COUNTS'
+ISSUE COUNTS
+\echo '============================================================================'
+============================================================================
+SELECT '🔴 Critical' AS severity, 'Tables with autovacuum disabled' AS issue, 
+    (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace 
+     WHERE c.relkind = 'r' AND c.reloptions::text LIKE '%autovacuum_enabled=false%')::text AS count
+UNION ALL
+SELECT '🔴 Critical', 'Inactive replication slots',
+    (SELECT count(*) FROM pg_replication_slots WHERE NOT active)::text
+UNION ALL
+SELECT '🟠 Warning', 'Zero-efficiency indexes',
+    (SELECT count(*) FROM pg_stat_user_indexes WHERE idx_tup_read > 10000 AND idx_tup_fetch = 0)::text
+UNION ALL
+SELECT '🟠 Warning', 'Low-efficiency indexes (<10%)',
+    (SELECT count(*) FROM pg_stat_user_indexes WHERE idx_tup_read > 100000 AND idx_tup_fetch::float / NULLIF(idx_tup_read, 0) < 0.10)::text
+UNION ALL
+SELECT '🟠 Warning', 'Unused indexes (>1MB)',
+    (SELECT count(*) FROM pg_stat_user_indexes ui JOIN pg_index i ON ui.indexrelid = i.indexrelid 
+     WHERE idx_scan = 0 AND pg_relation_size(ui.indexrelid) > 1024*1024 AND NOT i.indisprimary AND NOT i.indisunique)::text
+UNION ALL
+SELECT '🟠 Warning', 'Tables needing VACUUM (>10% dead)',
+    (SELECT count(*) FROM pg_stat_user_tables WHERE n_dead_tup > n_live_tup * 0.1 AND n_live_tup > 1000)::text
+UNION ALL
+SELECT '🟠 Warning', 'Tables with bloat (>20% dead)',
+    (SELECT count(*) FROM pg_stat_user_tables WHERE n_dead_tup > n_live_tup * 0.2 AND n_live_tup > 1000)::text
+UNION ALL
+SELECT '🟡 Info', 'Tables never analyzed',
+    (SELECT count(*) FROM pg_stat_user_tables WHERE last_analyze IS NULL AND last_autoanalyze IS NULL AND n_live_tup > 1000)::text
+UNION ALL
+SELECT '🟡 Info', 'Queries using temp files',
+    (SELECT count(*) FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) AND temp_blks_written > 0)::text;
+  severity   |               issue               | count 
+-------------+-----------------------------------+-------
+ 🔴 Critical | Tables with autovacuum disabled   | 0
+ 🔴 Critical | Inactive replication slots        | 0
+ 🟠 Warning  | Zero-efficiency indexes           | 32
+ 🟠 Warning  | Low-efficiency indexes (<10%)     | 149
+ 🟠 Warning  | Unused indexes (>1MB)             | 56
+ 🟠 Warning  | Tables needing VACUUM (>10% dead) | 1
+ 🟠 Warning  | Tables with bloat (>20% dead)     | 0
+ 🟡 Info     | Tables never analyzed             | 0
+ 🟡 Info     | Queries using temp files          | 48
+(9 rows)
+
+\echo ''
+
+\echo '╔══════════════════════════════════════════════════════════════════════════╗'
+╔══════════════════════════════════════════════════════════════════════════╗
+\echo '║                     END OF COMPREHENSIVE REPORT                           ║'
+║                     END OF COMPREHENSIVE REPORT                           ║
+\echo '╚══════════════════════════════════════════════════════════════════════════╝'
+╚══════════════════════════════════════════════════════════════════════════╝
